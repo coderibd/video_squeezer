@@ -1,188 +1,1330 @@
-//! Video Squeezer
-//!
-//! Recursively scans a directory tree for video files, probes them with
-//! `ffprobe`, compresses files that exceed the configured size or resolution,
-//! and creates a thumbnail contact sheet for every discovered video.
-//!
-//! On macOS, the default `auto` encoder mode prefers Apple VideoToolbox for
-//! substantially faster hardware-assisted H.264 or HEVC encoding. The program
-//! falls back to software encoding when the requested hardware encoder is not
-//! available. Originals are never modified or deleted.
-
-// Error handling, command-line parsing, parallel iteration, JSON decoding,
-// filesystem traversal, and child-process execution dependencies.
-use anyhow::{bail, Context, Result};
-use clap::{Parser, ValueEnum};
-use rayon::prelude::*;
+use crossbeam_channel::{unbounded, Receiver, Sender};
+use eframe::egui::{
+    self, Align, Color32, CornerRadius, Layout, RichText, Stroke, StrokeKind, Vec2,
+};
 use serde::Deserialize;
 use std::{
-    ffi::OsStr,
     fs,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        atomic::{AtomicUsize, Ordering},
-        mpsc,
+        atomic::{AtomicBool, Ordering},
+        Arc,
     },
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use walkdir::WalkDir;
 
-// Binary mebibyte used consistently for input and output size comparisons.
 const MIB: u64 = 1024 * 1024;
+const APP_BG: Color32 = Color32::from_rgb(243, 244, 247);
+const PANEL_BG: Color32 = Color32::from_rgb(251, 251, 252);
+const CARD_BG: Color32 = Color32::WHITE;
+const BORDER: Color32 = Color32::from_rgb(218, 220, 225);
+const MUTED: Color32 = Color32::from_rgb(104, 110, 120);
+const BLUE: Color32 = Color32::from_rgb(38, 112, 238);
+const GREEN: Color32 = Color32::from_rgb(49, 169, 82);
+const ORANGE: Color32 = Color32::from_rgb(235, 144, 24);
+const RED: Color32 = Color32::from_rgb(211, 66, 66);
+const PURPLE: Color32 = Color32::from_rgb(128, 76, 204);
 
-/// Video compression format requested by the user.
-///
-/// The selected codec is mapped separately to software and VideoToolbox
-/// encoder names because FFmpeg exposes them as different encoders.
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum VideoCodec {
+fn main() -> eframe::Result<()> {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1480.0, 920.0])
+            .with_min_inner_size([1080.0, 720.0]),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "Video Squeezer",
+        options,
+        Box::new(|cc| {
+            configure_style(&cc.egui_ctx);
+            Ok(Box::<VideoSqueezerApp>::default())
+        }),
+    )
+}
+
+fn configure_style(ctx: &egui::Context) {
+    let mut style = (*ctx.style()).clone();
+    style.visuals = egui::Visuals::light();
+    style.visuals.panel_fill = APP_BG;
+    style.visuals.window_fill = PANEL_BG;
+    style.visuals.faint_bg_color = Color32::from_rgb(246, 247, 249);
+    style.visuals.extreme_bg_color = Color32::WHITE;
+    style.visuals.widgets.inactive.bg_fill = Color32::WHITE;
+    style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, BORDER);
+    style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(239, 244, 252);
+    style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, BLUE);
+    style.visuals.widgets.active.bg_fill = Color32::from_rgb(229, 238, 252);
+    style.visuals.widgets.active.bg_stroke = Stroke::new(1.0, BLUE);
+    style.visuals.selection.bg_fill = Color32::from_rgb(222, 235, 255);
+    style.visuals.selection.stroke = Stroke::new(1.0, BLUE);
+    style.spacing.item_spacing = Vec2::new(8.0, 8.0);
+    style.spacing.button_padding = Vec2::new(12.0, 7.0);
+    style.spacing.interact_size.y = 30.0;
+    ctx.set_style(style);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Codec {
     H264,
     H265,
-    Av1,
 }
 
-impl VideoCodec {
-    /// Return the FFmpeg CPU encoder corresponding to this codec.
-    fn software_encoder(self) -> &'static str {
+impl Codec {
+    fn label(self) -> &'static str {
         match self {
-            Self::H264 => "libx264",
-            Self::H265 => "libx265",
-            Self::Av1 => "libsvtav1",
-        }
-    }
-
-    /// Return the Apple VideoToolbox encoder when this codec is supported.
-    /// AV1 intentionally returns `None` because this program has no
-    /// VideoToolbox AV1 path.
-    fn hardware_encoder(self) -> Option<&'static str> {
-        match self {
-            Self::H264 => Some("h264_videotoolbox"),
-            Self::H265 => Some("hevc_videotoolbox"),
-            Self::Av1 => None,
-        }
-    }
-
-    /// Choose a speed-oriented default preset for CPU encoding.
-    /// Users can override this value with `--preset`.
-    fn default_software_preset(self) -> &'static str {
-        match self {
-            Self::H264 | Self::H265 => "veryfast",
-            Self::Av1 => "8",
+            Self::H264 => "H.264 (widest compatibility)",
+            Self::H265 => "H.265 / HEVC (smaller files)",
         }
     }
 }
 
-/// Selects whether encoding is performed by the CPU or Apple hardware.
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EncoderMode {
-    /// Use VideoToolbox on macOS when available, otherwise use software encoding.
     Auto,
-    /// Always use CPU-based encoding.
+    VideoToolbox,
     Software,
-    /// Require Apple's VideoToolbox hardware encoder.
-    Videotoolbox,
 }
 
-/// Complete command-line configuration parsed by Clap.
-///
-/// Defaults favor safe unattended processing: originals remain untouched,
-/// output is written under a separate root, and one large file is encoded at
-/// a time unless the user explicitly increases `--jobs`.
-#[derive(Debug, Parser)]
-#[command(
-    name = "video-squeezer",
-    version,
-    about = "Recursively compress oversized/high-resolution videos and generate contact sheets"
-)]
-struct Args {
-    /// Drive or directory to scan recursively.
-    #[arg(value_name = "INPUT_ROOT")]
-    input_root: PathBuf,
+impl EncoderMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto (VideoToolbox if available)",
+            Self::VideoToolbox => "Apple VideoToolbox",
+            Self::Software => "Software encoder",
+        }
+    }
+}
 
-    /// Root directory for compressed videos and contact sheets.
-    #[arg(short, long, value_name = "DIR")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FileState {
+    Queued,
+    Processing,
+    Completed,
+    Skipped,
+    Failed,
+    Cancelled,
+}
+
+impl FileState {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Queued => "Queued",
+            Self::Processing => "Processing",
+            Self::Completed => "Completed",
+            Self::Skipped => "Skipped",
+            Self::Failed => "Failed",
+            Self::Cancelled => "Cancelled",
+        }
+    }
+
+    fn color(&self) -> Color32 {
+        match self {
+            Self::Queued => MUTED,
+            Self::Processing => BLUE,
+            Self::Completed => GREEN,
+            Self::Skipped => PURPLE,
+            Self::Failed => RED,
+            Self::Cancelled => ORANGE,
+        }
+    }
+
+    fn icon(&self) -> &'static str {
+        match self {
+            Self::Queued => "◷",
+            Self::Processing => "▶",
+            Self::Completed => "✓",
+            Self::Skipped => "↷",
+            Self::Failed => "!",
+            Self::Cancelled => "■",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct VideoRow {
+    path: PathBuf,
+    state: FileState,
+    progress: f32,
+    original_bytes: u64,
+    output_bytes: Option<u64>,
+    resolution: Option<(u32, u32)>,
+    target_resolution: Option<(u32, u32)>,
+    duration_secs: Option<f64>,
+    preview_path: Option<PathBuf>,
+    encoder: Option<String>,
+    message: String,
+}
+
+impl VideoRow {
+    fn name(&self) -> String {
+        self.path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("<unknown>")
+            .to_owned()
+    }
+}
+
+#[derive(Clone)]
+struct JobConfig {
+    input: PathBuf,
     output: PathBuf,
-
-    /// Maximum output width.
-    #[arg(long, default_value_t = 1280)]
-    max_width: u32,
-
-    /// Maximum output height.
-    #[arg(long, default_value_t = 720)]
-    max_height: u32,
-
-    /// Target maximum output size in MiB. A safety margin is applied.
-    #[arg(long, default_value_t = 1000)]
     target_mib: u64,
-
-    /// Fraction of target size reserved as a safety margin (0.03 = 3%).
-    #[arg(long, default_value_t = 0.03, value_parser = parse_size_margin)]
-    size_margin: f64,
-
-    /// Video codec used for transcoding.
-    #[arg(long, value_enum, default_value_t = VideoCodec::H265)]
-    codec: VideoCodec,
-
-    /// Encoder implementation. Auto uses VideoToolbox on supported Macs.
-    #[arg(long, value_enum, default_value_t = EncoderMode::Auto)]
-    encoder: EncoderMode,
-
-    /// Software encoder speed/preset. Ignored by VideoToolbox.
-    #[arg(long)]
-    preset: Option<String>,
-
-    /// Number of files processed concurrently. One is recommended for large videos.
-    #[arg(short = 'j', long, default_value_t = 1, value_parser = parse_positive_usize)]
-    jobs: usize,
-
-    /// Number of thumbnails in each contact sheet.
-    #[arg(long, default_value_t = 12, value_parser = parse_thumbnail_count)]
-    thumbnails: u32,
-
-    /// Number of columns in each contact sheet.
-    #[arg(long, default_value_t = 4, value_parser = parse_thumbnail_columns)]
-    thumbnail_columns: u32,
-
-    /// Width of each thumbnail in pixels.
-    #[arg(long, default_value_t = 320)]
-    thumbnail_width: u32,
-
-    /// Replace existing generated files.
-    #[arg(long)]
-    overwrite: bool,
-
-    /// Probe and report actions without writing output files.
-    #[arg(long)]
-    dry_run: bool,
-
-    /// Include symbolic links while walking the input tree.
-    #[arg(long)]
-    follow_links: bool,
-
-    /// Keep audio bitrate at or below this many kbit/s.
-    #[arg(long, default_value_t = 128)]
+    max_width: u32,
+    max_height: u32,
+    codec: Codec,
+    encoder_mode: EncoderMode,
+    software_preset: String,
     audio_kbps: u32,
-
-    /// Paths containing any of these directory names are skipped.
-    #[arg(
-        long,
-        value_delimiter = ',',
-        default_value = ".git,@eaDir,$RECYCLE.BIN,System Volume Information"
-    )]
-    exclude_dirs: Vec<String>,
+    size_margin: f64,
+    thumbnails: u32,
+    thumbnail_columns: u32,
+    overwrite: bool,
+    make_contact_sheet: bool,
 }
 
-/// Top-level portion of the JSON document returned by `ffprobe`.
+enum WorkerEvent {
+    ScanComplete(Vec<VideoRow>),
+    Started(usize, String),
+    PreviewReady(usize, PathBuf),
+    Progress(usize, f32),
+    Finished(usize, u64, String),
+    Skipped(usize, String),
+    Failed(usize, String),
+    Cancelled(usize),
+    Log(String),
+    AllDone,
+}
+
+struct VideoSqueezerApp {
+    input_dir: String,
+    output_dir: String,
+    target_mib: u64,
+    max_resolution: usize,
+    codec: Codec,
+    encoder_mode: EncoderMode,
+    software_preset: String,
+    audio_kbps: u32,
+    size_margin: f64,
+    thumbnails: u32,
+    thumbnail_columns: u32,
+    overwrite: bool,
+    make_contact_sheet: bool,
+    rows: Vec<VideoRow>,
+    log: Vec<String>,
+    running: bool,
+    scanning: bool,
+    selected_row: Option<usize>,
+    preview_texture: Option<egui::TextureHandle>,
+    preview_loaded_from: Option<PathBuf>,
+    show_log: bool,
+    tx: Sender<WorkerEvent>,
+    rx: Receiver<WorkerEvent>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Default for VideoSqueezerApp {
+    fn default() -> Self {
+        let (tx, rx) = unbounded();
+        Self {
+            input_dir: String::new(),
+            output_dir: String::new(),
+            target_mib: 1000,
+            max_resolution: 1,
+            codec: Codec::H265,
+            encoder_mode: EncoderMode::Auto,
+            software_preset: "veryfast".to_owned(),
+            audio_kbps: 128,
+            size_margin: 0.03,
+            thumbnails: 12,
+            thumbnail_columns: 4,
+            overwrite: false,
+            make_contact_sheet: true,
+            rows: Vec::new(),
+            log: vec!["Choose input and output folders, then scan or start processing.".to_owned()],
+            running: false,
+            scanning: false,
+            selected_row: None,
+            preview_texture: None,
+            preview_loaded_from: None,
+            show_log: false,
+            tx,
+            rx,
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+impl eframe::App for VideoSqueezerApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.receive_events();
+        self.refresh_preview_texture(ctx);
+        if self.running || self.scanning {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+
+        egui::TopBottomPanel::top("title_bar")
+            .exact_height(50.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(248, 248, 250))
+                    .inner_margin(egui::Margin::symmetric(18, 8))
+                    .stroke(Stroke::new(1.0, BORDER)),
+            )
+            .show(ctx, |ui| {
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    ui.label(RichText::new("Video Squeezer").size(20.0).strong());
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("Fast, size-aware video compression for macOS").color(MUTED),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(RichText::new("v0.3.0").color(MUTED).small());
+                    });
+                });
+            });
+
+        egui::TopBottomPanel::bottom("status_bar")
+            .exact_height(34.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(248, 248, 250))
+                    .inner_margin(egui::Margin::symmetric(16, 6))
+                    .stroke(Stroke::new(1.0, BORDER)),
+            )
+            .show(ctx, |ui| self.status_bar(ui));
+
+        egui::SidePanel::left("settings")
+            .resizable(false)
+            .exact_width(360.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(PANEL_BG)
+                    .inner_margin(egui::Margin::same(18))
+                    .stroke(Stroke::new(1.0, BORDER)),
+            )
+            .show(ctx, |ui| self.settings_panel(ui));
+
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(APP_BG)
+                    .inner_margin(egui::Margin::same(16)),
+            )
+            .show(ctx, |ui| self.main_panel(ui));
+    }
+}
+
+impl VideoSqueezerApp {
+    fn section_label(ui: &mut egui::Ui, text: &str) {
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(text.to_uppercase())
+                .size(11.0)
+                .strong()
+                .color(Color32::from_rgb(57, 60, 67)),
+        );
+    }
+
+    fn settings_panel(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                Self::section_label(ui, "Input");
+                self.folder_field(ui, true);
+                ui.checkbox(
+                    &mut self.make_contact_sheet,
+                    "Generate contact sheet (JPEG)",
+                );
+
+                Self::section_label(ui, "Output");
+                self.folder_field(ui, false);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            !self.output_dir.is_empty(),
+                            egui::Button::new("Open in Finder"),
+                        )
+                        .clicked()
+                    {
+                        let _ = Command::new("open").arg(&self.output_dir).spawn();
+                    }
+                });
+
+                Self::section_label(ui, "Target size");
+                ui.horizontal(|ui| {
+                    ui.add_sized(
+                        [210.0, 30.0],
+                        egui::DragValue::new(&mut self.target_mib).range(50..=100_000),
+                    );
+                    ui.label("MiB");
+                });
+                ui.label(
+                    RichText::new("Videos larger than this will be compressed.")
+                        .small()
+                        .color(MUTED),
+                );
+
+                Self::section_label(ui, "Max resolution");
+                let choices = [
+                    (854, 480, "854×480 (480p)"),
+                    (1280, 720, "1280×720 (720p)"),
+                    (1920, 1080, "1920×1080 (1080p)"),
+                    (3840, 2160, "3840×2160 (4K)"),
+                ];
+                egui::ComboBox::from_id_salt("resolution")
+                    .width(300.0)
+                    .selected_text(choices[self.max_resolution].2)
+                    .show_ui(ui, |ui| {
+                        for (index, (_, _, label)) in choices.iter().enumerate() {
+                            ui.selectable_value(&mut self.max_resolution, index, *label);
+                        }
+                    });
+                ui.label(
+                    RichText::new("Higher-resolution videos will be downscaled.")
+                        .small()
+                        .color(MUTED),
+                );
+
+                Self::section_label(ui, "Codec");
+                egui::ComboBox::from_id_salt("codec")
+                    .width(300.0)
+                    .selected_text(self.codec.label())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.codec, Codec::H264, Codec::H264.label());
+                        ui.selectable_value(&mut self.codec, Codec::H265, Codec::H265.label());
+                    });
+
+                Self::section_label(ui, "Encoder");
+                egui::ComboBox::from_id_salt("encoder")
+                    .width(300.0)
+                    .selected_text(self.encoder_mode.label())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.encoder_mode,
+                            EncoderMode::Auto,
+                            EncoderMode::Auto.label(),
+                        );
+                        ui.selectable_value(
+                            &mut self.encoder_mode,
+                            EncoderMode::VideoToolbox,
+                            EncoderMode::VideoToolbox.label(),
+                        );
+                        ui.selectable_value(
+                            &mut self.encoder_mode,
+                            EncoderMode::Software,
+                            EncoderMode::Software.label(),
+                        );
+                    });
+
+                if self.encoder_mode != EncoderMode::VideoToolbox {
+                    Self::section_label(ui, "Software preset");
+                    egui::ComboBox::from_id_salt("preset")
+                        .width(300.0)
+                        .selected_text(&self.software_preset)
+                        .show_ui(ui, |ui| {
+                            for preset in [
+                                "ultrafast",
+                                "superfast",
+                                "veryfast",
+                                "faster",
+                                "fast",
+                                "medium",
+                            ] {
+                                ui.selectable_value(
+                                    &mut self.software_preset,
+                                    preset.to_owned(),
+                                    preset,
+                                );
+                            }
+                        });
+                }
+
+                Self::section_label(ui, "Audio bitrate");
+                egui::ComboBox::from_id_salt("audio")
+                    .width(300.0)
+                    .selected_text(format!("{} kbps (AAC)", self.audio_kbps))
+                    .show_ui(ui, |ui| {
+                        for bitrate in [64, 96, 128, 160, 192, 256] {
+                            ui.selectable_value(
+                                &mut self.audio_kbps,
+                                bitrate,
+                                format!("{bitrate} kbps (AAC)"),
+                            );
+                        }
+                    });
+
+                Self::section_label(ui, "Size margin");
+                ui.horizontal(|ui| {
+                    ui.add_sized(
+                        [240.0, 24.0],
+                        egui::Slider::new(&mut self.size_margin, 0.0..=0.20).show_value(false),
+                    );
+                    ui.monospace(format!("{:.2}", self.size_margin));
+                });
+                ui.label(
+                    RichText::new("Leaves headroom beneath the target size.")
+                        .small()
+                        .color(MUTED),
+                );
+
+                ui.add_space(8.0);
+                ui.checkbox(&mut self.overwrite, "Overwrite existing output files");
+
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    let can_start = !self.running && !self.scanning && self.valid_paths();
+                    let start =
+                        egui::Button::new(RichText::new("▶  Start").color(Color32::WHITE).strong())
+                            .fill(BLUE)
+                            .stroke(Stroke::NONE)
+                            .corner_radius(CornerRadius::same(5))
+                            .min_size(Vec2::new(185.0, 38.0));
+                    if ui.add_enabled(can_start, start).clicked() {
+                        self.start_processing();
+                    }
+                    let stop = egui::Button::new("■  Stop").min_size(Vec2::new(105.0, 38.0));
+                    if ui.add_enabled(self.running, stop).clicked() {
+                        self.cancel.store(true, Ordering::Relaxed);
+                        self.log.push("Cancellation requested.".to_owned());
+                    }
+                });
+                if ui
+                    .add_enabled(
+                        !self.running && !self.scanning && !self.input_dir.is_empty(),
+                        egui::Button::new("Scan only"),
+                    )
+                    .clicked()
+                {
+                    self.scan_only();
+                }
+            });
+    }
+
+    fn folder_field(&mut self, ui: &mut egui::Ui, input: bool) {
+        let value = if input {
+            &mut self.input_dir
+        } else {
+            &mut self.output_dir
+        };
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("▣").color(BLUE).size(16.0));
+            ui.add_sized([242.0, 30.0], egui::TextEdit::singleline(value));
+            if ui.button("Choose…").clicked() {
+                if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                    *value = path.display().to_string();
+                }
+            }
+        });
+    }
+
+    fn main_panel(&mut self, ui: &mut egui::Ui) {
+        let (total, completed, processing, remaining, overall) = self.summary_counts();
+
+        ui.label(RichText::new("Processing").size(17.0).strong());
+        ui.add_space(6.0);
+        ui.columns(4, |columns| {
+            stat_card(
+                &mut columns[0],
+                "▣",
+                PURPLE,
+                "Total Files",
+                total.to_string(),
+            );
+            stat_card(
+                &mut columns[1],
+                "✓",
+                BLUE,
+                "Completed",
+                completed.to_string(),
+            );
+            stat_card(
+                &mut columns[2],
+                "◌",
+                GREEN,
+                "Processing",
+                processing.to_string(),
+            );
+            stat_card(
+                &mut columns[3],
+                "◷",
+                ORANGE,
+                "Remaining",
+                remaining.to_string(),
+            );
+        });
+
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Overall Progress").strong());
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(RichText::new(format!("{:.0}%", overall * 100.0)).strong());
+            });
+        });
+        ui.add(
+            egui::ProgressBar::new(overall)
+                .desired_height(8.0)
+                .fill(BLUE),
+        );
+        ui.add_space(10.0);
+
+        self.queue_table(ui);
+        ui.add_space(10.0);
+        self.details_panel(ui);
+
+        if self.show_log {
+            ui.add_space(8.0);
+            egui::Frame::new()
+                .fill(CARD_BG)
+                .stroke(Stroke::new(1.0, BORDER))
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(egui::Margin::same(10))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Activity log").strong());
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.small_button("Hide").clicked() {
+                                self.show_log = false;
+                            }
+                        });
+                    });
+                    egui::ScrollArea::vertical()
+                        .max_height(110.0)
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            for line in &self.log {
+                                ui.monospace(RichText::new(line).small());
+                            }
+                        });
+                });
+        }
+    }
+
+    fn queue_table(&mut self, ui: &mut egui::Ui) {
+        let max_height = (ui.available_height() - 230.0).max(230.0);
+        egui::Frame::new()
+            .fill(CARD_BG)
+            .stroke(Stroke::new(1.0, BORDER))
+            .corner_radius(CornerRadius::same(8))
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(max_height)
+                    .show(ui, |ui| {
+                        egui::Grid::new("queue_grid")
+                            .striped(true)
+                            .min_col_width(76.0)
+                            .spacing(Vec2::new(12.0, 7.0))
+                            .show(ui, |ui| {
+                                ui.label("");
+                                ui.strong("File");
+                                ui.strong("Status");
+                                ui.strong("Progress");
+                                ui.strong("Original");
+                                ui.strong("Output");
+                                ui.strong("Resolution");
+                                ui.end_row();
+
+                                for index in 0..self.rows.len() {
+                                    let row = &self.rows[index];
+                                    let selected = self.selected_row == Some(index);
+                                    let response = ui.selectable_label(
+                                        selected,
+                                        RichText::new(row.state.icon())
+                                            .color(row.state.color())
+                                            .strong(),
+                                    );
+                                    if response.clicked() {
+                                        self.selected_row = Some(index);
+                                    }
+                                    let response = ui.selectable_label(selected, row.name());
+                                    if response.clicked() {
+                                        self.selected_row = Some(index);
+                                    }
+                                    response.on_hover_text(row.path.display().to_string());
+                                    ui.label(
+                                        RichText::new(row.state.label()).color(row.state.color()),
+                                    );
+                                    ui.add(
+                                        egui::ProgressBar::new(row.progress)
+                                            .desired_width(135.0)
+                                            .desired_height(8.0)
+                                            .fill(row.state.color())
+                                            .show_percentage(),
+                                    );
+                                    ui.label(format_bytes(row.original_bytes));
+                                    ui.label(
+                                        row.output_bytes
+                                            .map(format_bytes)
+                                            .unwrap_or_else(|| "—".to_owned()),
+                                    );
+                                    ui.label(resolution_text(row));
+                                    ui.end_row();
+                                }
+                            });
+                    });
+            });
+    }
+
+    fn details_panel(&mut self, ui: &mut egui::Ui) {
+        let index = self
+            .selected_row
+            .or_else(|| {
+                self.rows
+                    .iter()
+                    .position(|r| r.state == FileState::Processing)
+            })
+            .or_else(|| (!self.rows.is_empty()).then_some(0));
+        egui::Frame::new()
+            .fill(CARD_BG)
+            .stroke(Stroke::new(1.0, BORDER))
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(egui::Margin::same(12))
+            .show(ui, |ui| {
+                ui.set_min_height(170.0);
+                if let Some(index) = index {
+                    let row = &self.rows[index];
+                    ui.horizontal(|ui| {
+                        self.preview_widget(ui, row);
+                        ui.add_space(12.0);
+                        ui.vertical(|ui| {
+                            ui.set_max_width(620.0);
+                            ui.add(
+                                egui::Label::new(RichText::new(row.name()).size(17.0).strong())
+                                    .wrap(),
+                            );
+                            let metadata = match (row.resolution, row.duration_secs) {
+                                (Some((w, h)), Some(duration)) => format!(
+                                    "{w}×{h}    {}    {}",
+                                    format_duration(duration),
+                                    format_bytes(row.original_bytes)
+                                ),
+                                (Some((w, h)), None) => {
+                                    format!("{w}×{h}    {}", format_bytes(row.original_bytes))
+                                }
+                                _ => format_bytes(row.original_bytes),
+                            };
+                            ui.label(RichText::new(metadata).color(MUTED));
+                            ui.add_space(6.0);
+                            ui.label(format!("Status: {}", row.state.label()));
+                            if let Some(encoder) = &row.encoder {
+                                ui.label(format!("Encoding with {encoder}"));
+                            }
+                            if !row.message.is_empty() {
+                                ui.label(RichText::new(&row.message).color(MUTED));
+                            }
+                            ui.add_space(8.0);
+                            ui.add(
+                                egui::ProgressBar::new(row.progress)
+                                    .desired_width(560.0)
+                                    .desired_height(9.0)
+                                    .fill(row.state.color())
+                                    .show_percentage(),
+                            );
+                        });
+                        ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
+                            if ui
+                                .add_enabled(
+                                    !self.output_dir.is_empty(),
+                                    egui::Button::new("▣  Open Output Folder"),
+                                )
+                                .clicked()
+                            {
+                                let _ = Command::new("open").arg(&self.output_dir).spawn();
+                            }
+                        });
+                    });
+                } else {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(
+                            RichText::new(
+                                "Scan a folder to see video previews and processing details.",
+                            )
+                            .color(MUTED),
+                        );
+                    });
+                }
+            });
+    }
+
+    fn preview_widget(&self, ui: &mut egui::Ui, _row: &VideoRow) {
+        let size = Vec2::new(220.0, 135.0);
+        let (rect, _response) = ui.allocate_exact_size(size, egui::Sense::hover());
+        let rounding = CornerRadius::same(7);
+        let painter = ui.painter().with_clip_rect(rect);
+
+        painter.rect_filled(rect, rounding, Color32::from_rgb(26, 29, 35));
+        painter.rect_stroke(
+            rect,
+            rounding,
+            Stroke::new(1.0, Color32::from_rgb(48, 53, 63)),
+            StrokeKind::Inside,
+        );
+
+        if let Some(texture) = &self.preview_texture {
+            let texture_size = texture.size_vec2();
+            if texture_size.x > 0.0 && texture_size.y > 0.0 {
+                let scale = (size.x / texture_size.x).min(size.y / texture_size.y);
+                let shown = texture_size * scale;
+                let image_rect =
+                    egui::Rect::from_center_size(rect.center(), shown).intersect(rect.shrink(1.0));
+                painter.image(
+                    texture.id(),
+                    image_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+            }
+        } else {
+            painter.text(
+                rect.center() - egui::vec2(0.0, 12.0),
+                egui::Align2::CENTER_CENTER,
+                "▶",
+                egui::FontId::proportional(34.0),
+                Color32::from_rgb(160, 170, 185),
+            );
+            painter.text(
+                rect.center() + egui::vec2(0.0, 24.0),
+                egui::Align2::CENTER_CENTER,
+                "Preview",
+                egui::FontId::proportional(14.0),
+                Color32::from_rgb(190, 195, 205),
+            );
+        }
+    }
+
+    fn status_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let (dot, text) = if self.running {
+                (
+                    GREEN,
+                    "Processing with hardware acceleration when available",
+                )
+            } else if self.scanning {
+                (ORANGE, "Scanning video files")
+            } else {
+                (GREEN, "Ready")
+            };
+            ui.label(RichText::new("●").color(dot));
+            ui.label(RichText::new(text).color(MUTED));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui
+                    .small_button(if self.show_log {
+                        "Hide Log"
+                    } else {
+                        "Show Log"
+                    })
+                    .clicked()
+                {
+                    self.show_log = !self.show_log;
+                }
+                let active = self
+                    .rows
+                    .iter()
+                    .filter(|r| r.state == FileState::Processing)
+                    .count();
+                ui.label(RichText::new(format!("{active} file(s) processing")).color(MUTED));
+            });
+        });
+    }
+
+    fn summary_counts(&self) -> (usize, usize, usize, usize, f32) {
+        let total = self.rows.len();
+        let completed = self
+            .rows
+            .iter()
+            .filter(|r| matches!(r.state, FileState::Completed | FileState::Skipped))
+            .count();
+        let processing = self
+            .rows
+            .iter()
+            .filter(|r| r.state == FileState::Processing)
+            .count();
+        let remaining = self
+            .rows
+            .iter()
+            .filter(|r| r.state == FileState::Queued)
+            .count();
+        let overall = if total == 0 {
+            0.0
+        } else {
+            self.rows.iter().map(|r| r.progress).sum::<f32>() / total as f32
+        };
+        (total, completed, processing, remaining, overall)
+    }
+
+    fn valid_paths(&self) -> bool {
+        !self.input_dir.trim().is_empty() && !self.output_dir.trim().is_empty()
+    }
+
+    fn config(&self) -> JobConfig {
+        let resolutions = [(854, 480), (1280, 720), (1920, 1080), (3840, 2160)];
+        let (max_width, max_height) = resolutions[self.max_resolution];
+        JobConfig {
+            input: PathBuf::from(self.input_dir.trim()),
+            output: PathBuf::from(self.output_dir.trim()),
+            target_mib: self.target_mib,
+            max_width,
+            max_height,
+            codec: self.codec,
+            encoder_mode: self.encoder_mode,
+            software_preset: self.software_preset.trim().to_owned(),
+            audio_kbps: self.audio_kbps,
+            size_margin: self.size_margin,
+            thumbnails: self.thumbnails,
+            thumbnail_columns: self.thumbnail_columns,
+            overwrite: self.overwrite,
+            make_contact_sheet: self.make_contact_sheet,
+        }
+    }
+
+    fn scan_only(&mut self) {
+        self.scanning = true;
+        self.rows.clear();
+        self.selected_row = None;
+        self.preview_texture = None;
+        self.preview_loaded_from = None;
+        self.log.push("Scanning input folder…".to_owned());
+        let input = PathBuf::from(self.input_dir.trim());
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let rows = scan_videos(&input);
+            let _ = tx.send(WorkerEvent::ScanComplete(rows));
+        });
+    }
+
+    fn start_processing(&mut self) {
+        self.running = true;
+        self.cancel.store(false, Ordering::Relaxed);
+        self.rows.clear();
+        self.selected_row = None;
+        self.preview_texture = None;
+        self.preview_loaded_from = None;
+        self.log
+            .push("Scanning and starting processing…".to_owned());
+        let config = self.config();
+        let tx = self.tx.clone();
+        let cancel = self.cancel.clone();
+        thread::spawn(move || run_worker(config, tx, cancel));
+    }
+
+    fn receive_events(&mut self) {
+        while let Ok(event) = self.rx.try_recv() {
+            match event {
+                WorkerEvent::ScanComplete(rows) => {
+                    self.rows = rows;
+                    self.scanning = false;
+                    if self.selected_row.is_none() && !self.rows.is_empty() {
+                        self.selected_row = Some(0);
+                    }
+                    self.log
+                        .push(format!("Scan complete: {} video file(s).", self.rows.len()));
+                }
+                WorkerEvent::Started(index, encoder) => {
+                    if let Some(row) = self.rows.get_mut(index) {
+                        row.state = FileState::Processing;
+                        row.encoder = Some(encoder.clone());
+                        row.message = format!("Encoding with {encoder}");
+                    }
+                    self.selected_row = Some(index);
+                }
+                WorkerEvent::PreviewReady(index, path) => {
+                    if let Some(row) = self.rows.get_mut(index) {
+                        row.preview_path = Some(path);
+                    }
+                    self.preview_loaded_from = None;
+                }
+                WorkerEvent::Progress(index, progress) => {
+                    if let Some(row) = self.rows.get_mut(index) {
+                        row.progress = progress.clamp(0.0, 0.99);
+                    }
+                }
+                WorkerEvent::Finished(index, bytes, message) => {
+                    if let Some(row) = self.rows.get_mut(index) {
+                        row.state = FileState::Completed;
+                        row.progress = 1.0;
+                        row.output_bytes = Some(bytes);
+                        row.message = message;
+                    }
+                }
+                WorkerEvent::Skipped(index, message) => {
+                    if let Some(row) = self.rows.get_mut(index) {
+                        row.state = FileState::Skipped;
+                        row.progress = 1.0;
+                        row.message = message;
+                    }
+                }
+                WorkerEvent::Failed(index, message) => {
+                    if let Some(row) = self.rows.get_mut(index) {
+                        row.state = FileState::Failed;
+                        row.progress = 1.0;
+                        row.message = message.clone();
+                    }
+                    self.log.push(format!("ERROR: {message}"));
+                }
+                WorkerEvent::Cancelled(index) => {
+                    if let Some(row) = self.rows.get_mut(index) {
+                        row.state = FileState::Cancelled;
+                        row.progress = 1.0;
+                        row.message = "Cancelled".to_owned();
+                    }
+                }
+                WorkerEvent::Log(line) => self.log.push(line),
+                WorkerEvent::AllDone => {
+                    self.running = false;
+                    self.scanning = false;
+                    self.log.push("Processing finished.".to_owned());
+                }
+            }
+        }
+    }
+
+    fn refresh_preview_texture(&mut self, ctx: &egui::Context) {
+        let path = self
+            .selected_row
+            .and_then(|index| self.rows.get(index))
+            .and_then(|row| row.preview_path.clone());
+        if path == self.preview_loaded_from {
+            return;
+        }
+        self.preview_texture = None;
+        self.preview_loaded_from = path.clone();
+        let Some(path) = path else {
+            return;
+        };
+        let Ok(bytes) = fs::read(&path) else {
+            return;
+        };
+        let Ok(image) = image::load_from_memory(&bytes) else {
+            return;
+        };
+        let rgba = image.to_rgba8();
+        let size = [rgba.width() as usize, rgba.height() as usize];
+        let color_image = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+        self.preview_texture =
+            Some(ctx.load_texture("video-preview", color_image, egui::TextureOptions::LINEAR));
+    }
+}
+
+fn stat_card(ui: &mut egui::Ui, icon: &str, color: Color32, title: &str, value: String) {
+    egui::Frame::new()
+        .fill(CARD_BG)
+        .stroke(Stroke::new(1.0, BORDER))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(egui::Margin::symmetric(16, 14))
+        .show(ui, |ui| {
+            ui.set_min_height(62.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(icon).size(28.0).color(color).strong());
+                ui.add_space(10.0);
+                ui.vertical(|ui| {
+                    ui.label(RichText::new(title).color(MUTED));
+                    ui.label(RichText::new(value).size(20.0).strong());
+                });
+            });
+        });
+}
+
+fn run_worker(config: JobConfig, tx: Sender<WorkerEvent>, cancel: Arc<AtomicBool>) {
+    if let Err(error) = fs::create_dir_all(&config.output) {
+        let _ = tx.send(WorkerEvent::Log(format!(
+            "Unable to create output directory: {error}"
+        )));
+        let _ = tx.send(WorkerEvent::AllDone);
+        return;
+    }
+
+    let rows = scan_videos(&config.input);
+    let _ = tx.send(WorkerEvent::ScanComplete(rows.clone()));
+
+    for (index, row) in rows.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = tx.send(WorkerEvent::Cancelled(index));
+            continue;
+        }
+        match process_video(index, row, &config, &tx, &cancel) {
+            Ok(()) => {}
+            Err(error) => {
+                let _ = tx.send(WorkerEvent::Failed(
+                    index,
+                    format!("{}: {error:#}", row.path.display()),
+                ));
+            }
+        }
+    }
+    let _ = tx.send(WorkerEvent::AllDone);
+}
+
+fn scan_videos(root: &Path) -> Vec<VideoRow> {
+    WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .filter(|entry| is_video(entry.path()))
+        .map(|entry| {
+            let path = entry.into_path();
+            let original_bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            let probe = probe_video(&path).ok();
+            VideoRow {
+                path,
+                state: FileState::Queued,
+                progress: 0.0,
+                original_bytes,
+                output_bytes: None,
+                resolution: probe.as_ref().map(|p| (p.width, p.height)),
+                target_resolution: None,
+                duration_secs: probe.as_ref().map(|p| p.duration_secs),
+                preview_path: None,
+                encoder: None,
+                message: String::new(),
+            }
+        })
+        .collect()
+}
+
+fn process_video(
+    index: usize,
+    row: &VideoRow,
+    config: &JobConfig,
+    tx: &Sender<WorkerEvent>,
+    cancel: &Arc<AtomicBool>,
+) -> anyhow::Result<()> {
+    let probe = probe_video(&row.path)?;
+    let must_compress = row.original_bytes > config.target_mib * MIB
+        || probe.width > config.max_width
+        || probe.height > config.max_height;
+
+    let relative = row.path.strip_prefix(&config.input).unwrap_or(&row.path);
+    let relative_parent = relative.parent().unwrap_or_else(|| Path::new(""));
+    let output_dir = config.output.join(relative_parent);
+    fs::create_dir_all(&output_dir)?;
+    let stem = row
+        .path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("video");
+    let output_path = output_dir.join(format!("{stem}.compressed.mp4"));
+    let partial_path = output_dir.join(format!(".{stem}.compressed.partial.mp4"));
+    let contact_path = output_dir.join(format!("{stem}.contact-sheet.jpg"));
+    let contact_partial = output_dir.join(format!(".{stem}.contact-sheet.partial.jpg"));
+    let preview_dir = config.output.join(".video-squeezer-previews");
+    fs::create_dir_all(&preview_dir)?;
+    let preview_path = preview_dir.join(format!("{}-{}.jpg", index, sanitize_filename(stem)));
+
+    if create_preview_frame(&row.path, &preview_path, probe.duration_secs).is_ok() {
+        let _ = tx.send(WorkerEvent::PreviewReady(index, preview_path));
+    }
+
+    if !must_compress {
+        if config.make_contact_sheet && (config.overwrite || !contact_path.exists()) {
+            create_contact_sheet(&row.path, &contact_partial, &contact_path, config)?;
+        }
+        let _ = tx.send(WorkerEvent::Skipped(
+            index,
+            "Already within configured limits".to_owned(),
+        ));
+        return Ok(());
+    }
+
+    if output_path.exists() && !config.overwrite {
+        let size = fs::metadata(&output_path)?.len();
+        let _ = tx.send(WorkerEvent::Finished(
+            index,
+            size,
+            "Existing output retained".to_owned(),
+        ));
+        return Ok(());
+    }
+
+    let encoder = select_encoder(config)?;
+    let _ = tx.send(WorkerEvent::Started(index, encoder.clone()));
+    let _ = fs::remove_file(&partial_path);
+
+    let target_bits =
+        (config.target_mib as f64 * MIB as f64 * 8.0 * (1.0 - config.size_margin)) as u64;
+    let audio_bps = config.audio_kbps as u64 * 1000;
+    let video_bps = ((target_bits as f64 / probe.duration_secs) as u64)
+        .saturating_sub(audio_bps)
+        .max(250_000);
+    let scale = format!(
+        "scale={}:{}:force_original_aspect_ratio=decrease:force_divisible_by=2",
+        config.max_width, config.max_height
+    );
+
+    let mut command = Command::new("ffmpeg");
+    command
+        .args(["-hide_banner", "-y", "-i"])
+        .arg(&row.path)
+        .args([
+            "-map", "0:v:0", "-map", "0:a?", "-vf", &scale, "-c:v", &encoder,
+        ]);
+
+    if encoder.contains("videotoolbox") {
+        command.args(["-b:v", &video_bps.to_string(), "-allow_sw", "1"]);
+        if config.codec == Codec::H265 {
+            command.args(["-tag:v", "hvc1"]);
+        }
+    } else {
+        command.args([
+            "-preset",
+            &config.software_preset,
+            "-b:v",
+            &video_bps.to_string(),
+        ]);
+    }
+
+    command
+        .args(["-c:a", "aac", "-b:a", &format!("{}k", config.audio_kbps)])
+        .args(["-movflags", "+faststart", "-progress", "pipe:1", "-nostats"])
+        .arg(&partial_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+    let mut child = command.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("Unable to read FFmpeg progress"))?;
+    let reader = BufReader::new(stdout);
+
+    for line in reader.lines().map_while(Result::ok) {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_file(&partial_path);
+            let _ = tx.send(WorkerEvent::Cancelled(index));
+            return Ok(());
+        }
+        if let Some(value) = line.strip_prefix("out_time_ms=") {
+            if let Ok(microseconds) = value.parse::<f64>() {
+                let progress = (microseconds / 1_000_000.0 / probe.duration_secs) as f32;
+                let _ = tx.send(WorkerEvent::Progress(index, progress));
+            }
+        }
+    }
+
+    let status = child.wait()?;
+    if !status.success() {
+        let _ = fs::remove_file(&partial_path);
+        anyhow::bail!("FFmpeg exited with {status}");
+    }
+
+    if output_path.exists() {
+        fs::remove_file(&output_path)?;
+    }
+    fs::rename(&partial_path, &output_path)?;
+
+    if config.make_contact_sheet {
+        create_contact_sheet(&output_path, &contact_partial, &contact_path, config)?;
+    }
+
+    let size = fs::metadata(&output_path)?.len();
+    let _ = tx.send(WorkerEvent::Finished(
+        index,
+        size,
+        format!("Encoded with {encoder}"),
+    ));
+    Ok(())
+}
+
+fn select_encoder(config: &JobConfig) -> anyhow::Result<String> {
+    let software = match config.codec {
+        Codec::H264 => "libx264",
+        Codec::H265 => "libx265",
+    };
+    let hardware = match config.codec {
+        Codec::H264 => "h264_videotoolbox",
+        Codec::H265 => "hevc_videotoolbox",
+    };
+    match config.encoder_mode {
+        EncoderMode::Software => Ok(software.to_owned()),
+        EncoderMode::VideoToolbox => {
+            if ffmpeg_has_encoder(hardware) {
+                Ok(hardware.to_owned())
+            } else {
+                anyhow::bail!("FFmpeg does not provide {hardware}")
+            }
+        }
+        EncoderMode::Auto => {
+            if ffmpeg_has_encoder(hardware) {
+                Ok(hardware.to_owned())
+            } else {
+                Ok(software.to_owned())
+            }
+        }
+    }
+}
+
+fn ffmpeg_has_encoder(name: &str) -> bool {
+    Command::new("ffmpeg")
+        .args(["-hide_banner", "-encoders"])
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).contains(name))
+        .unwrap_or(false)
+}
+
+fn create_preview_frame(input: &Path, output: &Path, duration_secs: f64) -> anyhow::Result<()> {
+    let seek = (duration_secs * 0.10).clamp(1.0, 300.0);
+    let status = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-ss",
+            &format!("{seek:.3}"),
+            "-i",
+        ])
+        .arg(input)
+        .args(["-frames:v", "1", "-vf", "scale=640:-2", "-q:v", "3"])
+        .arg(output)
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("Unable to create preview frame")
+    }
+    Ok(())
+}
+
+fn create_contact_sheet(
+    input: &Path,
+    partial: &Path,
+    final_path: &Path,
+    config: &JobConfig,
+) -> anyhow::Result<()> {
+    let _ = fs::remove_file(partial);
+    let columns = config.thumbnail_columns.max(1);
+    let rows = config.thumbnails.div_ceil(columns);
+    let filter = format!(
+        "fps=1/60,scale=320:-2,tile={}x{}:nb_frames={}:padding=4:margin=4",
+        columns, rows, config.thumbnails
+    );
+    let status = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+        .arg(input)
+        .args(["-vf", &filter, "-frames:v", "1", "-f", "image2"])
+        .arg(partial)
+        .status()?;
+    if !status.success() {
+        let _ = fs::remove_file(partial);
+        anyhow::bail!("FFmpeg failed while creating the contact sheet")
+    }
+    if final_path.exists() {
+        fs::remove_file(final_path)?;
+    }
+    fs::rename(partial, final_path)?;
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 struct ProbeOutput {
     streams: Vec<ProbeStream>,
     format: ProbeFormat,
 }
-
-/// Stream fields needed from each `ffprobe` stream record.
 #[derive(Debug, Deserialize)]
 struct ProbeStream {
     codec_type: Option<String>,
@@ -190,846 +1332,116 @@ struct ProbeStream {
     height: Option<u32>,
     duration: Option<String>,
 }
-
-/// Container-level duration and byte-size fields reported by `ffprobe`.
 #[derive(Debug, Deserialize)]
 struct ProbeFormat {
     duration: Option<String>,
-    size: Option<String>,
 }
-
-/// Normalized metadata used by the processing and bitrate calculations.
-#[derive(Debug)]
-struct VideoInfo {
+#[derive(Debug, Clone)]
+struct ProbeInfo {
     width: u32,
     height: u32,
     duration_secs: f64,
-    size_bytes: u64,
 }
 
-/// Resolved FFmpeg encoder and whether it is hardware accelerated.
-#[derive(Debug, Clone)]
-struct SelectedEncoder {
-    name: &'static str,
-    hardware: bool,
-}
-
-/// Per-file counters merged into the final process summary.
-#[derive(Default)]
-struct Outcome {
-    compressed: usize,
-    contact_sheet: usize,
-    skipped: usize,
-}
-
-/// Program entry point: validate configuration, select an encoder, discover
-/// files, process them in parallel, and report aggregate results.
-fn main() -> Result<()> {
-    let args = Args::parse();
-    validate_environment(&args)?;
-    let selected_encoder = select_encoder(&args)?;
-
-    println!(
-        "Encoder: {} ({})",
-        selected_encoder.name,
-        if selected_encoder.hardware {
-            "Apple VideoToolbox hardware"
-        } else {
-            "software"
-        }
-    );
-
-    // Configure Rayon once so `--jobs` limits the number of videos that may be
-    // encoded simultaneously. This does not change FFmpeg's internal threads.
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(args.jobs)
-        .build_global()
-        .context("failed to configure worker pool")?;
-
-    let videos = discover_videos(&args)?;
-    println!("Found {} candidate video file(s)", videos.len());
-
-    let compressed = AtomicUsize::new(0);
-    let sheets = AtomicUsize::new(0);
-    let skipped = AtomicUsize::new(0);
-    let failed = AtomicUsize::new(0);
-
-    // Each file is independent. Atomic counters avoid locking while worker
-    // threads update the final summary.
-    videos
-        .par_iter()
-        .for_each(|path| match process_video(path, &args, &selected_encoder) {
-            Ok(outcome) => {
-                compressed.fetch_add(outcome.compressed, Ordering::Relaxed);
-                sheets.fetch_add(outcome.contact_sheet, Ordering::Relaxed);
-                skipped.fetch_add(outcome.skipped, Ordering::Relaxed);
-            }
-            Err(error) => {
-                failed.fetch_add(1, Ordering::Relaxed);
-                eprintln!("ERROR: {}: {error:#}", path.display());
-            }
-        });
-
-    println!(
-        "Done: compressed={}, contact_sheets={}, skipped={}, failed={}",
-        compressed.load(Ordering::Relaxed),
-        sheets.load(Ordering::Relaxed),
-        skipped.load(Ordering::Relaxed),
-        failed.load(Ordering::Relaxed)
-    );
-
-    if failed.load(Ordering::Relaxed) > 0 {
-        bail!("one or more files failed");
-    }
-    Ok(())
-}
-
-/// Parse and constrain the safety margin used for output-size targeting.
-fn parse_size_margin(value: &str) -> Result<f64, String> {
-    let margin = value
-        .parse::<f64>()
-        .map_err(|_| format!("invalid size margin: {value}"))?;
-    if !margin.is_finite() || !(0.0..0.25).contains(&margin) {
-        return Err("size margin must be at least 0.0 and less than 0.25".to_string());
-    }
-    Ok(margin)
-}
-
-/// Parse a non-zero worker count for Rayon.
-fn parse_positive_usize(value: &str) -> Result<usize, String> {
-    let parsed = value
-        .parse::<usize>()
-        .map_err(|_| format!("invalid positive integer: {value}"))?;
-    if parsed == 0 {
-        return Err("value must be at least 1".to_string());
-    }
-    Ok(parsed)
-}
-
-/// Parse the requested number of contact-sheet frames.
-fn parse_thumbnail_count(value: &str) -> Result<u32, String> {
-    parse_u32_range(value, 1, 100, "thumbnail count")
-}
-
-/// Parse the number of columns used by FFmpeg's tile filter.
-fn parse_thumbnail_columns(value: &str) -> Result<u32, String> {
-    parse_u32_range(value, 1, 20, "thumbnail columns")
-}
-
-/// Shared bounded integer parser used by thumbnail-related options.
-fn parse_u32_range(value: &str, min: u32, max: u32, label: &str) -> Result<u32, String> {
-    let parsed = value
-        .parse::<u32>()
-        .map_err(|_| format!("invalid {label}: {value}"))?;
-    if !(min..=max).contains(&parsed) {
-        return Err(format!("{label} must be between {min} and {max}"));
-    }
-    Ok(parsed)
-}
-
-/// Validate arguments, ensure FFmpeg tools are callable, and create the output
-/// directory before any parallel work begins.
-fn validate_environment(args: &Args) -> Result<()> {
-    if !args.input_root.is_dir() {
-        bail!(
-            "input root is not a directory: {}",
-            args.input_root.display()
-        );
-    }
-    if args.target_mib < 16 {
-        bail!("--target-mib must be at least 16");
-    }
-    if args.max_width < 2 || args.max_height < 2 {
-        bail!("--max-width and --max-height must be at least 2");
-    }
-    if args.thumbnail_columns > args.thumbnails {
-        bail!("--thumbnail-columns cannot exceed --thumbnails");
-    }
-    check_program("ffmpeg")?;
-    check_program("ffprobe")?;
-    if !args.dry_run {
-        fs::create_dir_all(&args.output)
-            .with_context(|| format!("cannot create output directory {}", args.output.display()))?;
-    }
-    Ok(())
-}
-
-/// Confirm an external executable exists in `PATH` and can run successfully.
-fn check_program(name: &str) -> Result<()> {
-    let status = Command::new(name)
-        .arg("-version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .with_context(|| format!("{name} is not installed or not in PATH"))?;
-    if !status.success() {
-        bail!("{name} exists but failed its version check");
-    }
-    Ok(())
-}
-
-/// Resolve the requested codec and encoder mode to a concrete FFmpeg encoder.
-///
-/// In automatic mode on macOS, hardware encoding is preferred when available.
-/// All other cases resolve to the corresponding software encoder.
-fn select_encoder(args: &Args) -> Result<SelectedEncoder> {
-    let software = SelectedEncoder {
-        name: args.codec.software_encoder(),
-        hardware: false,
-    };
-
-    match args.encoder {
-        EncoderMode::Software => {
-            ensure_encoder_available(software.name)?;
-            Ok(software)
-        }
-        EncoderMode::Videotoolbox => {
-            let name = args.codec.hardware_encoder().context(
-                "VideoToolbox does not support AV1 in this program; use --encoder software",
-            )?;
-            ensure_encoder_available(name)?;
-            Ok(SelectedEncoder {
-                name,
-                hardware: true,
-            })
-        }
-        EncoderMode::Auto => {
-            if cfg!(target_os = "macos") {
-                if let Some(name) = args.codec.hardware_encoder() {
-                    if encoder_available(name)? {
-                        return Ok(SelectedEncoder {
-                            name,
-                            hardware: true,
-                        });
-                    }
-                    eprintln!(
-                        "WARN: {name} is unavailable in this FFmpeg build; falling back to {}",
-                        software.name
-                    );
-                }
-            }
-            ensure_encoder_available(software.name)?;
-            Ok(software)
-        }
-    }
-}
-
-/// Convert an unavailable FFmpeg encoder into a user-facing error.
-fn ensure_encoder_available(name: &str) -> Result<()> {
-    if !encoder_available(name)? {
-        bail!("FFmpeg encoder '{name}' is not available in your installation");
-    }
-    Ok(())
-}
-
-/// Inspect `ffmpeg -encoders` and test for an exact encoder-name match.
-fn encoder_available(name: &str) -> Result<bool> {
-    let output = Command::new("ffmpeg")
-        .args(["-hide_banner", "-encoders"])
-        .output()
-        .context("failed to query FFmpeg encoders")?;
-    if !output.status.success() {
-        bail!("FFmpeg failed while listing encoders");
-    }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .any(|line| line.split_whitespace().any(|field| field == name)))
-}
-
-/// Walk the input tree, skip excluded/output directories, and return supported
-/// video paths in deterministic sorted order.
-fn discover_videos(args: &Args) -> Result<Vec<PathBuf>> {
-    let output_abs = absolute_normalized(&args.output);
-    let mut result = Vec::new();
-
-    let walker = WalkDir::new(&args.input_root)
-        .follow_links(args.follow_links)
-        .into_iter()
-        // Pruning directories here prevents WalkDir from descending into them,
-        // which is faster than filtering their files after traversal.
-        .filter_entry(|entry| {
-            let path = absolute_normalized(entry.path());
-            if path.starts_with(&output_abs) {
-                return false;
-            }
-            if entry.file_type().is_dir() {
-                let name = entry.file_name().to_string_lossy();
-                return !args
-                    .exclude_dirs
-                    .iter()
-                    .any(|excluded| name.eq_ignore_ascii_case(excluded));
-            }
-            true
-        });
-
-    for entry in walker {
-        match entry {
-            Ok(entry) if entry.file_type().is_file() && is_video(entry.path()) => {
-                result.push(entry.into_path());
-            }
-            Ok(_) => {}
-            Err(error) => eprintln!("WARN: traversal error: {error}"),
-        }
-    }
-    result.sort();
-    Ok(result)
-}
-
-/// Determine whether a path has one of the supported video extensions.
-fn is_video(path: &Path) -> bool {
-    const EXTENSIONS: &[&str] = &[
-        "3gp", "avi", "flv", "m2ts", "m4v", "mkv", "mov", "mp4", "mpeg", "mpg", "mts", "ogv", "ts",
-        "vob", "webm", "wmv",
-    ];
-    path.extension()
-        .and_then(OsStr::to_str)
-        .is_some_and(|extension| {
-            EXTENSIONS
-                .iter()
-                .any(|known| extension.eq_ignore_ascii_case(known))
-        })
-}
-
-/// Process one video from probe through optional compression and contact-sheet
-/// generation. Output paths mirror the source directory structure.
-fn process_video(input: &Path, args: &Args, encoder: &SelectedEncoder) -> Result<Outcome> {
-    let info = probe_video(input)?;
-    let relative = input.strip_prefix(&args.input_root).unwrap_or(input);
-    let relative_parent = relative.parent().unwrap_or_else(|| Path::new(""));
-    let output_dir = args.output.join(relative_parent);
-    let stem = input
-        .file_stem()
-        .and_then(OsStr::to_str)
-        .context("video filename is not valid Unicode")?;
-
-    let output_video = output_dir.join(format!("{stem}.compressed.mp4"));
-    let contact_sheet = output_dir.join(format!("{stem}.contact-sheet.jpg"));
-
-    // A file is transcoded when either threshold is exceeded. A video already
-    // within both limits is left untouched, but still receives a contact sheet.
-    let too_large = info.size_bytes > args.target_mib * MIB;
-    let too_high_res = info.width > args.max_width || info.height > args.max_height;
-    let should_compress = too_large || too_high_res;
-
-    println!(
-        "{}: {}x{}, {:.2} MiB, {:.1}s -> {}",
-        input.display(),
-        info.width,
-        info.height,
-        info.size_bytes as f64 / MIB as f64,
-        info.duration_secs,
-        if should_compress {
-            format!("compress with {}", encoder.name)
-        } else {
-            "thumbnail only".to_string()
-        }
-    );
-
-    if args.dry_run {
-        return Ok(Outcome {
-            compressed: usize::from(should_compress),
-            contact_sheet: 1,
-            skipped: usize::from(!should_compress),
-        });
-    }
-
-    fs::create_dir_all(&output_dir)
-        .with_context(|| format!("cannot create {}", output_dir.display()))?;
-
-    let mut outcome = Outcome::default();
-
-    if should_compress {
-        compress_to_target(input, &output_video, &info, args, encoder)?;
-        outcome.compressed = 1;
-    } else {
-        outcome.skipped = 1;
-    }
-
-    // Generate the relatively inexpensive contact sheet after a successful encode.
-    generate_contact_sheet(input, &contact_sheet, &info, args)?;
-    outcome.contact_sheet = 1;
-
-    Ok(outcome)
-}
-
-/// Run `ffprobe`, decode its JSON response, and normalize required metadata.
-fn probe_video(path: &Path) -> Result<VideoInfo> {
+fn probe_video(path: &Path) -> anyhow::Result<ProbeInfo> {
     let output = Command::new("ffprobe")
         .args([
             "-v",
             "error",
             "-print_format",
             "json",
-            "-show_format",
             "-show_streams",
+            "-show_format",
         ])
         .arg(path)
-        .output()
-        .with_context(|| format!("failed to run ffprobe for {}", path.display()))?;
-
+        .output()?;
     if !output.status.success() {
-        bail!(
-            "ffprobe failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+        anyhow::bail!("ffprobe failed")
     }
-
-    let parsed: ProbeOutput = serde_json::from_slice(&output.stdout)
-        .with_context(|| format!("invalid ffprobe JSON for {}", path.display()))?;
-    let video = parsed
+    let parsed: ProbeOutput = serde_json::from_slice(&output.stdout)?;
+    let stream = parsed
         .streams
         .iter()
         .find(|stream| stream.codec_type.as_deref() == Some("video"))
-        .context("no video stream found")?;
-
-    let duration_secs = parsed
-        .format
+        .ok_or_else(|| anyhow::anyhow!("No video stream found"))?;
+    let duration = stream
         .duration
         .as_deref()
-        .or(video.duration.as_deref())
-        .context("duration is unavailable")?
-        .parse::<f64>()
-        .context("invalid duration")?;
-    if !duration_secs.is_finite() || duration_secs <= 0.0 {
-        bail!("invalid duration: {duration_secs}");
+        .or(parsed.format.duration.as_deref())
+        .ok_or_else(|| anyhow::anyhow!("Duration is unavailable"))?
+        .parse::<f64>()?;
+    if !duration.is_finite() || duration <= 0.0 {
+        anyhow::bail!("Invalid duration")
     }
-
-    // Some containers omit the size field. Filesystem metadata provides a
-    // reliable fallback without requiring another media-tool invocation.
-    let size_bytes = match parsed
-        .format
-        .size
-        .as_deref()
-        .and_then(|size| size.parse().ok())
-    {
-        Some(size) => size,
-        None => fs::metadata(path)?.len(),
-    };
-
-    Ok(VideoInfo {
-        width: video.width.context("video width is unavailable")?,
-        height: video.height.context("video height is unavailable")?,
-        duration_secs,
-        size_bytes,
+    Ok(ProbeInfo {
+        width: stream.width.unwrap_or(0),
+        height: stream.height.unwrap_or(0),
+        duration_secs: duration,
     })
 }
 
-/// Generate an evenly sampled JPEG thumbnail collage using FFmpeg filters.
-///
-/// No `drawtext` filter is used, keeping this compatible with minimal FFmpeg
-/// builds. The output filename associates the sheet with its source video.
-fn generate_contact_sheet(
-    input: &Path,
-    output: &Path,
-    info: &VideoInfo,
-    args: &Args,
-) -> Result<()> {
-    if output.exists() && !args.overwrite {
-        println!("  contact sheet exists; skipping: {}", output.display());
-        return Ok(());
-    }
-
-    // Sample frames at regular intervals while avoiding the exact beginning
-    // and end, where fades or blank frames are more common.
-    let rows = args.thumbnails.div_ceil(args.thumbnail_columns);
-    let interval = (info.duration_secs / (args.thumbnails as f64 + 1.0)).max(0.1);
-    let filter = format!(
-        "fps=1/{interval:.6},scale={}:-1,tile={}x{}:nb_frames={}:padding=6:margin=6",
-        args.thumbnail_width, args.thumbnail_columns, rows, args.thumbnails
-    );
-
-    // FFmpeg writes to a hidden partial file. Only a completed image is renamed
-    // into its final path, so interrupted runs do not leave valid-looking files.
-    let temp = temporary_path(output);
-    remove_stale_temp(&temp)?;
-
-    // Build a single-frame FFmpeg filter pipeline that samples, scales, and
-    // tiles the requested number of thumbnails into one JPEG image.
-    let mut command = Command::new("ffmpeg");
-    command
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-nostats",
-            "-stats_period",
-            "0.5",
-            "-progress",
-            "pipe:1",
-        ])
-        .arg("-y")
-        .arg("-ss")
-        .arg(format!("{interval:.3}"))
-        .arg("-i")
-        .arg(input)
-        .arg("-frames:v")
-        .arg("1")
-        .arg("-vf")
-        .arg(filter)
-        .arg("-q:v")
-        .arg("2")
-        .arg(&temp);
-
-    run_ffmpeg_with_progress(command, "Generating thumbnail collage", info.duration_secs)?;
-    atomic_replace(&temp, output, args.overwrite)?;
-    Ok(())
-}
-
-/// Transcode a video using a duration-derived bitrate budget.
-///
-/// The total target bytes are converted into bits per second, with a bounded
-/// share reserved for AAC audio. The remaining bitrate is assigned to video.
-fn compress_to_target(
-    input: &Path,
-    output: &Path,
-    info: &VideoInfo,
-    args: &Args,
-    encoder: &SelectedEncoder,
-) -> Result<()> {
-    if output.exists() && !args.overwrite {
-        println!("  compressed output exists; skipping: {}", output.display());
-        return Ok(());
-    }
-
-    // Reserve the configured margin because container overhead and encoder
-    // rate-control variation can otherwise push the finished file over target.
-    let target_bytes = (args.target_mib * MIB) as f64 * (1.0 - args.size_margin);
-    let total_bps = target_bytes * 8.0 / info.duration_secs;
-    let audio_bps = (args.audio_kbps as f64 * 1000.0).min(total_bps * 0.20);
-    let video_bps = total_bps - audio_bps;
-    if video_bps < 100_000.0 {
-        bail!(
-            "target size is unrealistic for {:.1}s duration (video bitrate would be {:.0} bps)",
-            info.duration_secs,
-            video_bps
-        );
-    }
-
-    let maxrate = (video_bps * 1.10).round() as u64;
-    let bufsize = (video_bps * 2.0).round() as u64;
-    let bitrate = video_bps.round() as u64;
-    // Downscale only when needed, preserve aspect ratio, and force even
-    // dimensions because common H.264/HEVC pixel formats require them.
-    let scale = format!(
-        "scale=w='min(iw,{})':h='min(ih,{})':force_original_aspect_ratio=decrease:force_divisible_by=2",
-        args.max_width, args.max_height
-    );
-    let temp = temporary_path(output);
-    remove_stale_temp(&temp)?;
-
-    println!(
-        "  target video bitrate: {:.0} kbit/s, audio: {:.0} kbit/s",
-        video_bps / 1000.0,
-        audio_bps / 1000.0
-    );
-
-    // Build the compression command incrementally because VideoToolbox and
-    // software encoders accept different rate-control and preset options.
-    let mut command = Command::new("ffmpeg");
-    command
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-nostats",
-            "-stats_period",
-            "0.5",
-            "-progress",
-            "pipe:1",
-        ])
-        .arg("-y")
-        .arg("-i")
-        .arg(input)
-        .arg("-map")
-        .arg("0:v:0")
-        .arg("-map")
-        .arg("0:a?")
-        .arg("-map_metadata")
-        .arg("0")
-        .arg("-map_chapters")
-        .arg("0")
-        .arg("-vf")
-        .arg(scale)
-        .arg("-c:v")
-        .arg(encoder.name);
-
-    if encoder.hardware {
-        // VideoToolbox does not accept libx264/libx265 preset names.
-        command.arg("-b:v").arg(bitrate.to_string());
-        if matches!(args.codec, VideoCodec::H265) {
-            command.arg("-tag:v").arg("hvc1");
-        }
-    } else {
-        let preset = args
-            .preset
-            .as_deref()
-            .unwrap_or(args.codec.default_software_preset());
-        command
-            .arg("-preset")
-            .arg(preset)
-            .arg("-b:v")
-            .arg(bitrate.to_string())
-            .arg("-maxrate")
-            .arg(maxrate.to_string())
-            .arg("-bufsize")
-            .arg(bufsize.to_string());
-    }
-
-    command
-        .arg("-c:a")
-        .arg("aac")
-        .arg("-b:a")
-        .arg(format!("{}k", (audio_bps / 1000.0).round() as u64))
-        .arg("-movflags")
-        .arg("+faststart")
-        .arg(&temp);
-
-    run_ffmpeg_with_progress(command, "Encoding video", info.duration_secs)?;
-
-    // Enforce the user's hard size ceiling before publishing the partial file.
-    // A failed size check deletes the temporary output and leaves any existing
-    // completed output untouched.
-    let actual = fs::metadata(&temp)?.len();
-    if actual > args.target_mib * MIB {
-        let _ = fs::remove_file(&temp);
-        bail!(
-            "encoded output is {:.2} MiB, above target {} MiB; increase --size-margin (for example, --size-margin 0.06)",
-            actual as f64 / MIB as f64,
-            args.target_mib
-        );
-    }
-
-    atomic_replace(&temp, output, args.overwrite)?;
-    Ok(())
-}
-
-/// Execute FFmpeg while presenting a live, single-line progress display.
-///
-/// FFmpeg's `-progress pipe:1` option emits stable `key=value` records. We
-/// parse the current media timestamp and reported speed instead of scraping
-/// human-oriented log output. The media timestamp divided by the known source
-/// duration provides completion percentage, while elapsed wall-clock time is
-/// used to estimate the remaining duration.
-fn run_ffmpeg_with_progress(
-    mut command: Command,
-    operation: &str,
-    duration_secs: f64,
-) -> Result<()> {
-    command.stdout(Stdio::piped()).stderr(Stdio::inherit());
-
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("failed to start ffmpeg for {operation}"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .context("failed to capture FFmpeg progress output")?;
-
-    // Read FFmpeg output on a helper thread so the main thread can refresh the
-    // display even during periods when FFmpeg emits no new progress record.
-    let (sender, receiver) = mpsc::channel::<String>();
-    let reader_thread = thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines() {
-            match line {
-                Ok(line) => {
-                    if sender.send(line).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
-    let started = Instant::now();
-    let mut processed_secs = 0.0_f64;
-    let mut reported_speed = String::from("--");
-    let mut finished_progress_stream = false;
-
-    eprint!("  {operation}: starting...");
-    let _ = std::io::stderr().flush();
-
-    while !finished_progress_stream {
-        match receiver.recv_timeout(Duration::from_millis(250)) {
-            Ok(line) => {
-                if let Some((key, value)) = line.split_once('=') {
-                    match key {
-                        // Modern FFmpeg reports microseconds in `out_time_us`.
-                        "out_time_us" => {
-                            if let Ok(microseconds) = value.parse::<f64>() {
-                                processed_secs = microseconds / 1_000_000.0;
-                            }
-                        }
-                        // Retained for compatibility with builds that expose
-                        // only `out_time_ms`; despite the name, FFmpeg has
-                        // historically reported this field in microseconds.
-                        "out_time_ms" if processed_secs == 0.0 => {
-                            if let Ok(microseconds) = value.parse::<f64>() {
-                                processed_secs = microseconds / 1_000_000.0;
-                            }
-                        }
-                        "speed" => reported_speed = value.trim().to_string(),
-                        "progress" if value == "end" => {
-                            finished_progress_stream = true;
-                            processed_secs = duration_secs;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                finished_progress_stream = true;
-            }
-        }
-
-        render_progress_line(
-            operation,
-            processed_secs,
-            duration_secs,
-            started.elapsed(),
-            &reported_speed,
-        );
-    }
-
-    let status = child
-        .wait()
-        .with_context(|| format!("failed while waiting for ffmpeg during {operation}"))?;
-    let _ = reader_thread.join();
-
-    if !status.success() {
-        eprintln!();
-        bail!("ffmpeg failed during {operation} with status {status}");
-    }
-
-    // Finish the line at exactly 100%, then move subsequent messages onto a
-    // fresh terminal line.
-    render_progress_line(
-        operation,
-        duration_secs,
-        duration_secs,
-        started.elapsed(),
-        &reported_speed,
-    );
-    eprintln!();
-    Ok(())
-}
-
-/// Render a compact terminal progress bar with timing and speed information.
-fn render_progress_line(
-    operation: &str,
-    processed_secs: f64,
-    duration_secs: f64,
-    elapsed: Duration,
-    speed: &str,
-) {
-    let fraction = if duration_secs > 0.0 {
-        (processed_secs / duration_secs).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    let percent = fraction * 100.0;
-    let bar_width = 30_usize;
-    let filled = (fraction * bar_width as f64).round() as usize;
-    let bar = format!(
-        "{}{}",
-        "=".repeat(filled.min(bar_width)),
-        " ".repeat(bar_width.saturating_sub(filled))
-    );
-
-    let eta = if fraction > 0.001 && fraction < 1.0 {
-        let remaining = elapsed.as_secs_f64() * (1.0 - fraction) / fraction;
-        format_duration(Duration::from_secs_f64(remaining.max(0.0)))
-    } else if fraction >= 1.0 {
-        "00:00".to_string()
-    } else {
-        "--:--".to_string()
-    };
-
-    let spinner = ["|", "/", "-", "\\"][(elapsed.as_millis() / 250) as usize % 4];
-    let activity = if processed_secs <= 0.0 { spinner } else { " " };
-
-    eprint!(
-        "\r  {} {:<27} [{}] {:6.2}%  elapsed {}  ETA {}  speed {:>7}",
-        activity,
-        operation,
-        bar,
-        percent,
-        format_duration(elapsed),
-        eta,
-        speed
-    );
-    let _ = std::io::stderr().flush();
-}
-
-/// Format a duration as `HH:MM:SS` for long jobs or `MM:SS` for short ones.
-fn format_duration(duration: Duration) -> String {
-    let total = duration.as_secs();
-    let hours = total / 3_600;
-    let minutes = (total % 3_600) / 60;
-    let seconds = total % 60;
-
-    if hours > 0 {
-        format!("{hours:02}:{minutes:02}:{seconds:02}")
-    } else {
-        format!("{minutes:02}:{seconds:02}")
-    }
-}
-
-/// Construct a hidden sibling path that preserves the final extension so
-/// FFmpeg can infer the desired output container or image format.
-fn temporary_path(final_path: &Path) -> PathBuf {
-    let stem = final_path
-        .file_stem()
-        .and_then(OsStr::to_str)
-        .unwrap_or("output");
-    let extension = final_path
-        .extension()
-        .and_then(OsStr::to_str)
-        .unwrap_or("tmp");
-    final_path.with_file_name(format!(".{stem}.partial.{extension}"))
-}
-
-/// Remove a partial file left by an interrupted or failed earlier run.
-fn remove_stale_temp(path: &Path) -> Result<()> {
-    if path.exists() {
-        fs::remove_file(path)
-            .with_context(|| format!("cannot remove stale temporary file {}", path.display()))?;
-    }
-    Ok(())
-}
-
-/// Publish a completed temporary file under its final name.
-///
-/// The rename occurs only after FFmpeg succeeds and all validation completes.
-fn atomic_replace(temp: &Path, final_path: &Path, overwrite: bool) -> Result<()> {
-    if final_path.exists() {
-        if overwrite {
-            fs::remove_file(final_path)
-                .with_context(|| format!("cannot replace {}", final_path.display()))?;
-        } else {
-            let _ = fs::remove_file(temp);
-            bail!("output already exists: {}", final_path.display());
-        }
-    }
-    fs::rename(temp, final_path).with_context(|| {
-        format!(
-            "cannot move completed file {} to {}",
-            temp.display(),
-            final_path.display()
+fn is_video(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .as_deref(),
+        Some(
+            "mp4"
+                | "mkv"
+                | "mov"
+                | "avi"
+                | "m4v"
+                | "webm"
+                | "wmv"
+                | "mpg"
+                | "mpeg"
+                | "ts"
+                | "mts"
+                | "m2ts"
         )
-    })
+    )
 }
 
-/// Convert a relative path to an absolute path without requiring it to exist.
-/// This is sufficient for excluding the output tree during directory walking.
-fn absolute_normalized(path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(path)
+fn resolution_text(row: &VideoRow) -> String {
+    match (row.resolution, row.target_resolution) {
+        (Some((w, h)), Some((tw, th))) => format!("{w}×{h} → {tw}×{th}"),
+        (Some((w, h)), None) => format!("{w}×{h}"),
+        _ => "—".to_owned(),
     }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.2} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    } else if bytes >= 1024 * 1024 {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    }
+}
+
+fn format_duration(seconds: f64) -> String {
+    let total = seconds.round() as u64;
+    let hours = total / 3600;
+    let minutes = (total % 3600) / 60;
+    let secs = total % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{secs:02}")
+    } else {
+        format!("{minutes}:{secs:02}")
+    }
+}
+
+fn sanitize_filename(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
