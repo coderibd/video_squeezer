@@ -18,9 +18,15 @@ use serde::Deserialize;
 use std::{
     ffi::OsStr,
     fs,
+    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
+    thread,
+    time::{Duration, Instant},
 };
 use walkdir::WalkDir;
 
@@ -250,8 +256,9 @@ fn main() -> Result<()> {
 
     // Each file is independent. Atomic counters avoid locking while worker
     // threads update the final summary.
-    videos.par_iter().for_each(|path| {
-        match process_video(path, &args, &selected_encoder) {
+    videos
+        .par_iter()
+        .for_each(|path| match process_video(path, &args, &selected_encoder) {
             Ok(outcome) => {
                 compressed.fetch_add(outcome.compressed, Ordering::Relaxed);
                 sheets.fetch_add(outcome.contact_sheet, Ordering::Relaxed);
@@ -261,8 +268,7 @@ fn main() -> Result<()> {
                 failed.fetch_add(1, Ordering::Relaxed);
                 eprintln!("ERROR: {}: {error:#}", path.display());
             }
-        }
-    });
+        });
 
     println!(
         "Done: compressed={}, contact_sheets={}, skipped={}, failed={}",
@@ -325,7 +331,10 @@ fn parse_u32_range(value: &str, min: u32, max: u32, label: &str) -> Result<u32, 
 /// directory before any parallel work begins.
 fn validate_environment(args: &Args) -> Result<()> {
     if !args.input_root.is_dir() {
-        bail!("input root is not a directory: {}", args.input_root.display());
+        bail!(
+            "input root is not a directory: {}",
+            args.input_root.display()
+        );
     }
     if args.target_mib < 16 {
         bail!("--target-mib must be at least 16");
@@ -375,10 +384,9 @@ fn select_encoder(args: &Args) -> Result<SelectedEncoder> {
             Ok(software)
         }
         EncoderMode::Videotoolbox => {
-            let name = args
-                .codec
-                .hardware_encoder()
-                .context("VideoToolbox does not support AV1 in this program; use --encoder software")?;
+            let name = args.codec.hardware_encoder().context(
+                "VideoToolbox does not support AV1 in this program; use --encoder software",
+            )?;
             ensure_encoder_available(name)?;
             Ok(SelectedEncoder {
                 name,
@@ -470,8 +478,8 @@ fn discover_videos(args: &Args) -> Result<Vec<PathBuf>> {
 /// Determine whether a path has one of the supported video extensions.
 fn is_video(path: &Path) -> bool {
     const EXTENSIONS: &[&str] = &[
-        "3gp", "avi", "flv", "m2ts", "m4v", "mkv", "mov", "mp4", "mpeg", "mpg", "mts",
-        "ogv", "ts", "vob", "webm", "wmv",
+        "3gp", "avi", "flv", "m2ts", "m4v", "mkv", "mov", "mp4", "mpeg", "mpg", "mts", "ogv", "ts",
+        "vob", "webm", "wmv",
     ];
     path.extension()
         .and_then(OsStr::to_str)
@@ -610,7 +618,12 @@ fn probe_video(path: &Path) -> Result<VideoInfo> {
 ///
 /// No `drawtext` filter is used, keeping this compatible with minimal FFmpeg
 /// builds. The output filename associates the sheet with its source video.
-fn generate_contact_sheet(input: &Path, output: &Path, info: &VideoInfo, args: &Args) -> Result<()> {
+fn generate_contact_sheet(
+    input: &Path,
+    output: &Path,
+    info: &VideoInfo,
+    args: &Args,
+) -> Result<()> {
     if output.exists() && !args.overwrite {
         println!("  contact sheet exists; skipping: {}", output.display());
         return Ok(());
@@ -634,7 +647,16 @@ fn generate_contact_sheet(input: &Path, output: &Path, info: &VideoInfo, args: &
     // tiles the requested number of thumbnails into one JPEG image.
     let mut command = Command::new("ffmpeg");
     command
-        .args(["-hide_banner", "-loglevel", "error"])
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostats",
+            "-stats_period",
+            "0.5",
+            "-progress",
+            "pipe:1",
+        ])
         .arg("-y")
         .arg("-ss")
         .arg(format!("{interval:.3}"))
@@ -648,7 +670,7 @@ fn generate_contact_sheet(input: &Path, output: &Path, info: &VideoInfo, args: &
         .arg("2")
         .arg(&temp);
 
-    run_command(command, "contact sheet generation")?;
+    run_ffmpeg_with_progress(command, "Generating thumbnail collage", info.duration_secs)?;
     atomic_replace(&temp, output, args.overwrite)?;
     Ok(())
 }
@@ -705,7 +727,16 @@ fn compress_to_target(
     // software encoders accept different rate-control and preset options.
     let mut command = Command::new("ffmpeg");
     command
-        .args(["-hide_banner", "-loglevel", "warning", "-stats"])
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostats",
+            "-stats_period",
+            "0.5",
+            "-progress",
+            "pipe:1",
+        ])
         .arg("-y")
         .arg("-i")
         .arg(input)
@@ -753,7 +784,7 @@ fn compress_to_target(
         .arg("+faststart")
         .arg(&temp);
 
-    run_command(command, "video compression")?;
+    run_ffmpeg_with_progress(command, "Encoding video", info.duration_secs)?;
 
     // Enforce the user's hard size ceiling before publishing the partial file.
     // A failed size check deletes the temporary output and leaves any existing
@@ -772,16 +803,178 @@ fn compress_to_target(
     Ok(())
 }
 
-/// Execute a prepared FFmpeg command and translate failure into context-rich
-/// application errors. FFmpeg retains control of its normal progress output.
-fn run_command(mut command: Command, operation: &str) -> Result<()> {
-    let status = command
-        .status()
+/// Execute FFmpeg while presenting a live, single-line progress display.
+///
+/// FFmpeg's `-progress pipe:1` option emits stable `key=value` records. We
+/// parse the current media timestamp and reported speed instead of scraping
+/// human-oriented log output. The media timestamp divided by the known source
+/// duration provides completion percentage, while elapsed wall-clock time is
+/// used to estimate the remaining duration.
+fn run_ffmpeg_with_progress(
+    mut command: Command,
+    operation: &str,
+    duration_secs: f64,
+) -> Result<()> {
+    command.stdout(Stdio::piped()).stderr(Stdio::inherit());
+
+    let mut child = command
+        .spawn()
         .with_context(|| format!("failed to start ffmpeg for {operation}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("failed to capture FFmpeg progress output")?;
+
+    // Read FFmpeg output on a helper thread so the main thread can refresh the
+    // display even during periods when FFmpeg emits no new progress record.
+    let (sender, receiver) = mpsc::channel::<String>();
+    let reader_thread = thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            match line {
+                Ok(line) => {
+                    if sender.send(line).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let started = Instant::now();
+    let mut processed_secs = 0.0_f64;
+    let mut reported_speed = String::from("--");
+    let mut finished_progress_stream = false;
+
+    eprint!("  {operation}: starting...");
+    let _ = std::io::stderr().flush();
+
+    while !finished_progress_stream {
+        match receiver.recv_timeout(Duration::from_millis(250)) {
+            Ok(line) => {
+                if let Some((key, value)) = line.split_once('=') {
+                    match key {
+                        // Modern FFmpeg reports microseconds in `out_time_us`.
+                        "out_time_us" => {
+                            if let Ok(microseconds) = value.parse::<f64>() {
+                                processed_secs = microseconds / 1_000_000.0;
+                            }
+                        }
+                        // Retained for compatibility with builds that expose
+                        // only `out_time_ms`; despite the name, FFmpeg has
+                        // historically reported this field in microseconds.
+                        "out_time_ms" if processed_secs == 0.0 => {
+                            if let Ok(microseconds) = value.parse::<f64>() {
+                                processed_secs = microseconds / 1_000_000.0;
+                            }
+                        }
+                        "speed" => reported_speed = value.trim().to_string(),
+                        "progress" if value == "end" => {
+                            finished_progress_stream = true;
+                            processed_secs = duration_secs;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                finished_progress_stream = true;
+            }
+        }
+
+        render_progress_line(
+            operation,
+            processed_secs,
+            duration_secs,
+            started.elapsed(),
+            &reported_speed,
+        );
+    }
+
+    let status = child
+        .wait()
+        .with_context(|| format!("failed while waiting for ffmpeg during {operation}"))?;
+    let _ = reader_thread.join();
+
     if !status.success() {
+        eprintln!();
         bail!("ffmpeg failed during {operation} with status {status}");
     }
+
+    // Finish the line at exactly 100%, then move subsequent messages onto a
+    // fresh terminal line.
+    render_progress_line(
+        operation,
+        duration_secs,
+        duration_secs,
+        started.elapsed(),
+        &reported_speed,
+    );
+    eprintln!();
     Ok(())
+}
+
+/// Render a compact terminal progress bar with timing and speed information.
+fn render_progress_line(
+    operation: &str,
+    processed_secs: f64,
+    duration_secs: f64,
+    elapsed: Duration,
+    speed: &str,
+) {
+    let fraction = if duration_secs > 0.0 {
+        (processed_secs / duration_secs).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let percent = fraction * 100.0;
+    let bar_width = 30_usize;
+    let filled = (fraction * bar_width as f64).round() as usize;
+    let bar = format!(
+        "{}{}",
+        "=".repeat(filled.min(bar_width)),
+        " ".repeat(bar_width.saturating_sub(filled))
+    );
+
+    let eta = if fraction > 0.001 && fraction < 1.0 {
+        let remaining = elapsed.as_secs_f64() * (1.0 - fraction) / fraction;
+        format_duration(Duration::from_secs_f64(remaining.max(0.0)))
+    } else if fraction >= 1.0 {
+        "00:00".to_string()
+    } else {
+        "--:--".to_string()
+    };
+
+    let spinner = ["|", "/", "-", "\\"][(elapsed.as_millis() / 250) as usize % 4];
+    let activity = if processed_secs <= 0.0 { spinner } else { " " };
+
+    eprint!(
+        "\r  {} {:<27} [{}] {:6.2}%  elapsed {}  ETA {}  speed {:>7}",
+        activity,
+        operation,
+        bar,
+        percent,
+        format_duration(elapsed),
+        eta,
+        speed
+    );
+    let _ = std::io::stderr().flush();
+}
+
+/// Format a duration as `HH:MM:SS` for long jobs or `MM:SS` for short ones.
+fn format_duration(duration: Duration) -> String {
+    let total = duration.as_secs();
+    let hours = total / 3_600;
+    let minutes = (total % 3_600) / 60;
+    let seconds = total % 60;
+
+    if hours > 0 {
+        format!("{hours:02}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes:02}:{seconds:02}")
+    }
 }
 
 /// Construct a hidden sibling path that preserves the final extension so
