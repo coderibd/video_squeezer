@@ -1,0 +1,472 @@
+import { Button, CheckBox, ComboBox, LineEdit, ListView, Slider, SpinBox } from "std-widgets.slint";
+
+export struct QueueItem {
+    name: string,
+    status: string,
+    status-icon: string,
+    status-color: color,
+    progress: float,
+    original: string,
+    output: string,
+    resolution: string,
+}
+
+component Surface inherits Rectangle {
+    background: #ffffff;
+    border-color: #d9dde5;
+    border-width: 1px;
+    border-radius: 10px;
+}
+
+component SectionLabel inherits Text {
+    color: #24262b;
+    font-size: 12px;
+    font-weight: 700;
+}
+
+component HintText inherits Text {
+    color: #767c87;
+    font-size: 11px;
+    wrap: word-wrap;
+}
+
+component HelpBadge inherits Rectangle {
+    callback clicked;
+    width: 23px;
+    height: 23px;
+    border-radius: 12px;
+    border-width: 1px;
+    border-color: #ccd1da;
+    background: touch.has-hover ? #edf3ff : #ffffff;
+    Text {
+        text: "?";
+        color: #535a67;
+        font-size: 12px;
+        font-weight: 700;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    touch := TouchArea { clicked => root.clicked(); }
+}
+
+component SummaryCard inherits Surface {
+    in property <string> icon;
+    in property <color> icon-color;
+    in property <string> label;
+    in property <string> value;
+
+    HorizontalLayout {
+        padding: 18px;
+        spacing: 15px;
+        Rectangle {
+            width: 50px;
+            height: 50px;
+            border-radius: 25px;
+            background: root.icon-color.with-alpha(0.12);
+            Text {
+                text: root.icon;
+                color: root.icon-color;
+                font-size: 28px;
+                font-weight: 700;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+        VerticalLayout {
+            spacing: 3px;
+            alignment: center;
+            Text { text: root.label; color: #676d78; font-size: 13px; }
+            Text { text: root.value; color: #17191d; font-size: 22px; font-weight: 700; }
+        }
+    }
+}
+
+component ThinProgress inherits Rectangle {
+    in property <float> value;
+    in property <color> fill-color: #2f75e8;
+    height: 7px;
+    border-radius: 4px;
+    background: #e6e9ee;
+    Rectangle {
+        width: max(0px, min(parent.width, parent.width * root.value));
+        height: parent.height;
+        border-radius: parent.border-radius;
+        background: root.fill-color;
+    }
+}
+
+component PrimaryButton inherits Rectangle {
+    callback clicked;
+    in property <string> text;
+    in property <string> icon;
+    in property <bool> enabled: true;
+    height: 44px;
+    border-radius: 7px;
+    background: !root.enabled ? #aabfe6 : touch.pressed ? #1759bf : touch.has-hover ? #317deb : #236fe4;
+    HorizontalLayout {
+        alignment: center;
+        spacing: 9px;
+        Text { text: root.icon; color: white; font-size: 17px; vertical-alignment: center; }
+        Text { text: root.text; color: white; font-size: 15px; font-weight: 600; vertical-alignment: center; }
+    }
+    touch := TouchArea { enabled: root.enabled; clicked => root.clicked(); }
+}
+
+component SecondaryButton inherits Rectangle {
+    callback clicked;
+    in property <string> text;
+    in property <string> icon;
+    in property <bool> enabled: true;
+    height: 38px;
+    border-radius: 7px;
+    border-width: 1px;
+    border-color: #cdd2db;
+    background: !root.enabled ? #f1f2f4 : touch.pressed ? #e1e5eb : touch.has-hover ? #f6f8fb : #ffffff;
+    HorizontalLayout {
+        alignment: center;
+        spacing: 8px;
+        Text { text: root.icon; color: root.enabled ? #3172cf : #9ba1aa; font-size: 15px; vertical-alignment: center; }
+        Text { text: root.text; color: root.enabled ? #24272c : #969ca5; font-size: 13px; font-weight: 500; vertical-alignment: center; }
+    }
+    touch := TouchArea { enabled: root.enabled; clicked => root.clicked(); }
+}
+
+export component AppWindow inherits Window {
+    title: "Video Squeezer";
+    preferred-width: 1540px;
+    preferred-height: 980px;
+    min-width: 1180px;
+    min-height: 760px;
+    background: #f1f2f5;
+
+    in-out property <string> input-path: "";
+    in-out property <string> output-path: "";
+    in-out property <bool> include-subdirectories: true;
+    in-out property <int> target-mib: 1000;
+    in-out property <string> max-resolution: "1280x720 (720p)";
+    in-out property <string> codec: "H.265 (HEVC)";
+    in-out property <string> encoder: "Auto (VideoToolbox if available)";
+    in-out property <string> preset: "Very Fast";
+    in-out property <string> audio-bitrate: "128 kbps (AAC)";
+    in-out property <float> size-margin: 0.03;
+    in-out property <int> jobs: 1;
+    in-out property <bool> overwrite-existing: false;
+    in-out property <bool> generate-contact-sheet: true;
+    in-out property <bool> skip-compliant: true;
+    in-out property <bool> use-hardware: true;
+
+    in property <[QueueItem]> queue;
+    in property <int> total-files: 0;
+    in property <int> completed-files: 0;
+    in property <int> processing-files: 0;
+    in property <int> remaining-files: 0;
+    in property <float> overall-progress: 0;
+    in property <bool> running: false;
+    in property <bool> paused: false;
+    in property <string> footer-status: "Ready";
+    in property <string> footer-center: "No files processing";
+    in property <string> version-label: "Version 1.0.0";
+
+    in property <image> preview-image;
+    in property <string> selected-name: "Select a video";
+    in property <string> selected-metadata: "No video selected";
+    in property <string> selected-encoder: "";
+    in property <string> selected-eta: "";
+    in property <string> selected-elapsed: "";
+    in property <string> selected-speed: "";
+    in property <string> selected-compression: "";
+    in property <float> selected-progress: 0;
+
+    callback choose-input;
+    callback choose-output;
+    callback open-output;
+    callback scan;
+    callback start;
+    callback pause;
+    callback stop;
+    callback select-row(int);
+    callback show-help(string);
+
+    VerticalLayout {
+        spacing: 0px;
+
+        Rectangle {
+            height: 48px;
+            background: #f5f6f8;
+            border-width: 0px;
+            Text {
+                text: "Video Squeezer";
+                color: #1f2125;
+                font-size: 19px;
+                font-weight: 700;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            Rectangle { y: parent.height - 1px; height: 1px; width: parent.width; background: #d7dae0; }
+        }
+
+        HorizontalLayout {
+            spacing: 10px;
+            padding: 10px;
+
+            Surface {
+                width: 390px;
+                VerticalLayout {
+                    padding: 18px;
+                    spacing: 9px;
+
+                    SectionLabel { text: "INPUT"; }
+                    Rectangle {
+                        height: 39px;
+                        border-radius: 6px;
+                        border-width: 1px;
+                        border-color: #cfd4dd;
+                        background: #ffffff;
+                        HorizontalLayout {
+                            padding-left: 11px;
+                            padding-right: 5px;
+                            spacing: 8px;
+                            Text { text: "▰"; color: #4aa3df; font-size: 19px; vertical-alignment: center; }
+                            Text { text: root.input-path == "" ? "Choose an input folder" : root.input-path; color: #25282d; font-size: 13px; vertical-alignment: center; horizontal-stretch: 1; }
+                            Rectangle {
+                                width: 31px; border-radius: 5px; background: folder-in.has-hover ? #edf3ff : transparent;
+                                Text { text: "⌄"; color: #4b515c; horizontal-alignment: center; vertical-alignment: center; }
+                                folder-in := TouchArea { clicked => root.choose-input(); }
+                            }
+                        }
+                    }
+                    CheckBox { text: "Include subdirectories"; checked <=> root.include-subdirectories; }
+
+                    Rectangle { height: 8px; background: transparent; }
+                    SectionLabel { text: "OUTPUT"; }
+                    Rectangle {
+                        height: 39px;
+                        border-radius: 6px;
+                        border-width: 1px;
+                        border-color: #cfd4dd;
+                        background: #ffffff;
+                        HorizontalLayout {
+                            padding-left: 11px;
+                            padding-right: 5px;
+                            spacing: 8px;
+                            Text { text: "▰"; color: #4aa3df; font-size: 19px; vertical-alignment: center; }
+                            Text { text: root.output-path == "" ? "Choose an output folder" : root.output-path; color: #25282d; font-size: 13px; vertical-alignment: center; horizontal-stretch: 1; }
+                            Rectangle {
+                                width: 31px; border-radius: 5px; background: folder-out.has-hover ? #edf3ff : transparent;
+                                Text { text: "⌄"; color: #4b515c; horizontal-alignment: center; vertical-alignment: center; }
+                                folder-out := TouchArea { clicked => root.choose-output(); }
+                            }
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 10px;
+                        SecondaryButton { text: "Choose…"; icon: "▰"; horizontal-stretch: 1; clicked => root.choose-output(); }
+                        SecondaryButton { text: "Open in Finder"; icon: "↗"; horizontal-stretch: 1; enabled: root.output-path != ""; clicked => root.open-output(); }
+                    }
+
+                    Rectangle { height: 8px; background: transparent; }
+                    SectionLabel { text: "TARGET SIZE"; }
+                    HorizontalLayout {
+                        spacing: 10px;
+                        SpinBox { value <=> root.target-mib; minimum: 50; maximum: 100000; horizontal-stretch: 1; }
+                        ComboBox { width: 140px; model: ["MiB"]; current-value: "MiB"; }
+                    }
+                    HintText { text: "Videos larger than this will be compressed."; }
+
+                    SectionLabel { text: "MAX RESOLUTION"; }
+                    ComboBox {
+                        model: ["854x480 (480p)", "1280x720 (720p)", "1920x1080 (1080p)", "3840x2160 (4K)"];
+                        current-value <=> root.max-resolution;
+                    }
+                    HintText { text: "Videos larger than this will be downscaled."; }
+
+                    HorizontalLayout {
+                        SectionLabel { text: "CODEC"; horizontal-stretch: 1; }
+                        HelpBadge { clicked => root.show-help("codec"); }
+                    }
+                    ComboBox { model: ["H.264 (AVC)", "H.265 (HEVC)"]; current-value <=> root.codec; }
+
+                    HorizontalLayout {
+                        SectionLabel { text: "ENCODER"; horizontal-stretch: 1; }
+                        HelpBadge { clicked => root.show-help("encoder"); }
+                    }
+                    ComboBox { model: ["Auto (VideoToolbox if available)", "Apple VideoToolbox", "Software encoder"]; current-value <=> root.encoder; enabled: root.use-hardware; }
+
+                    HorizontalLayout {
+                        SectionLabel { text: "PRESET"; horizontal-stretch: 1; }
+                        HelpBadge { clicked => root.show-help("preset"); }
+                    }
+                    ComboBox { model: ["Ultra Fast", "Super Fast", "Very Fast", "Faster", "Fast", "Medium", "Slow"]; current-value <=> root.preset; }
+                    HintText { text: "Faster presets encode more quickly, with slightly less compression efficiency."; }
+
+                    HorizontalLayout {
+                        SectionLabel { text: "AUDIO BITRATE"; horizontal-stretch: 1; }
+                        HelpBadge { clicked => root.show-help("audio"); }
+                    }
+                    ComboBox { model: ["96 kbps (AAC)", "128 kbps (AAC)", "160 kbps (AAC)", "192 kbps (AAC)"]; current-value <=> root.audio-bitrate; }
+
+                    SectionLabel { text: "SIZE MARGIN"; }
+                    HorizontalLayout {
+                        Slider { value <=> root.size-margin; minimum: 0; maximum: 0.25; horizontal-stretch: 1; }
+                        Rectangle {
+                            width: 58px; height: 32px; border-radius: 5px; border-width: 1px; border-color: #cfd4dd; background: white;
+                            Text { text: round(root.size-margin * 100) / 100; color: #25282d; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                    }
+                    HintText { text: "Leave this much room under the target size (0.00 – 0.25)."; }
+
+                    SectionLabel { text: "JOBS (PARALLEL FILES)"; }
+                    SpinBox { value <=> root.jobs; minimum: 1; maximum: 8; }
+                    HintText { text: "Number of files to process at the same time. One is recommended for large 4K files."; }
+
+                    Rectangle { height: 4px; background: transparent; }
+                    CheckBox { text: "Overwrite existing files"; checked <=> root.overwrite-existing; }
+                    CheckBox { text: "Generate contact sheet (JPEG)"; checked <=> root.generate-contact-sheet; }
+                    CheckBox { text: "Skip files already under target size and resolution"; checked <=> root.skip-compliant; }
+                    CheckBox { text: "Use hardware acceleration when available"; checked <=> root.use-hardware; }
+
+                    Rectangle { vertical-stretch: 1; background: transparent; }
+                    HorizontalLayout {
+                        spacing: 10px;
+                        PrimaryButton { text: root.running ? "Running" : "Start"; icon: "▶"; enabled: !root.running; horizontal-stretch: 1; clicked => root.start(); }
+                        SecondaryButton { text: root.paused ? "Resume" : "Pause"; icon: root.paused ? "▶" : "Ⅱ"; enabled: root.running; width: 92px; clicked => root.pause(); }
+                        SecondaryButton { text: "Stop"; icon: "■"; enabled: root.running; width: 88px; clicked => root.stop(); }
+                    }
+                }
+            }
+
+            Surface {
+                horizontal-stretch: 1;
+                VerticalLayout {
+                    padding: 18px;
+                    spacing: 12px;
+
+                    Text { text: "Processing"; color: #17191d; font-size: 18px; font-weight: 700; }
+
+                    HorizontalLayout {
+                        spacing: 12px;
+                        SummaryCard { icon: "▦"; icon-color: #8850d2; label: "Total Files"; value: root.total-files; horizontal-stretch: 1; }
+                        SummaryCard { icon: "✓"; icon-color: #2469b8; label: "Completed"; value: root.completed-files; horizontal-stretch: 1; }
+                        SummaryCard { icon: "◔"; icon-color: #36a954; label: "Processing"; value: root.processing-files; horizontal-stretch: 1; }
+                        SummaryCard { icon: "◷"; icon-color: #ef9716; label: "Remaining"; value: root.remaining-files; horizontal-stretch: 1; }
+                    }
+
+                    HorizontalLayout {
+                        Text { text: "Overall Progress"; color: #1f2227; font-size: 13px; horizontal-stretch: 1; }
+                        Text { text: round(root.overall-progress * 100) + "%"; color: #1f2227; font-size: 13px; }
+                    }
+                    ThinProgress { value: root.overall-progress; fill-color: #2879ed; }
+
+                    Rectangle { height: 1px; background: #e1e4e9; }
+
+                    Rectangle {
+                        height: 31px;
+                        background: #fafbfc;
+                        HorizontalLayout {
+                            padding-left: 12px;
+                            padding-right: 12px;
+                            spacing: 12px;
+                            Text { text: "File"; color: #343840; font-size: 12px; font-weight: 600; horizontal-stretch: 3.0; vertical-alignment: center; }
+                            Text { text: "Status"; color: #343840; font-size: 12px; font-weight: 600; horizontal-stretch: 1.25; vertical-alignment: center; }
+                            Text { text: "Progress"; color: #343840; font-size: 12px; font-weight: 600; horizontal-stretch: 1.8; vertical-alignment: center; }
+                            Text { text: "Original"; color: #343840; font-size: 12px; font-weight: 600; horizontal-stretch: 1.0; vertical-alignment: center; }
+                            Text { text: "Output"; color: #343840; font-size: 12px; font-weight: 600; horizontal-stretch: 1.0; vertical-alignment: center; }
+                            Text { text: "Resolution"; color: #343840; font-size: 12px; font-weight: 600; horizontal-stretch: 1.55; vertical-alignment: center; }
+                        }
+                    }
+
+                    ListView {
+                        vertical-stretch: 1;
+                        for item[index] in root.queue : Rectangle {
+                            height: 38px;
+                            background: row-touch.has-hover ? #eef5ff : (Math.mod(index, 2) == 0 ? #ffffff : #fbfbfc);
+                            border-width: 0px;
+                            HorizontalLayout {
+                                padding-left: 12px;
+                                padding-right: 12px;
+                                spacing: 12px;
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    horizontal-stretch: 3.0;
+                                    Rectangle {
+                                        width: 18px; height: 18px; border-radius: 5px; background: item.status-color.with-alpha(0.14);
+                                        Text { text: item.status-icon; color: item.status-color; font-size: 12px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                                    }
+                                    Text { text: item.name; color: #24272c; font-size: 12px; vertical-alignment: center; horizontal-stretch: 1; }
+                                }
+                                Text { text: item.status; color: item.status-color; font-size: 12px; horizontal-stretch: 1.25; vertical-alignment: center; }
+                                HorizontalLayout {
+                                    spacing: 9px;
+                                    horizontal-stretch: 1.8;
+                                    ThinProgress { value: item.progress; fill-color: item.status-color; horizontal-stretch: 1; }
+                                    Text { text: round(item.progress * 100) + "%"; color: #25282d; font-size: 12px; width: 38px; vertical-alignment: center; }
+                                }
+                                Text { text: item.original; color: #343840; font-size: 12px; horizontal-stretch: 1.0; vertical-alignment: center; }
+                                Text { text: item.output; color: #343840; font-size: 12px; horizontal-stretch: 1.0; vertical-alignment: center; }
+                                Text { text: item.resolution; color: #343840; font-size: 12px; horizontal-stretch: 1.55; vertical-alignment: center; }
+                            }
+                            Rectangle { y: parent.height - 1px; height: 1px; width: parent.width; background: #eceef2; }
+                            row-touch := TouchArea { clicked => root.select-row(index); }
+                        }
+                    }
+
+                    Surface {
+                        height: 180px;
+                        HorizontalLayout {
+                            padding: 12px;
+                            spacing: 18px;
+                            Rectangle {
+                                width: 240px;
+                                height: 154px;
+                                border-radius: 8px;
+                                background: #20242b;
+                                clip: true;
+                                Image { source: root.preview-image; image-fit: cover; width: 100%; height: 100%; }
+                                Rectangle { y: 116px; height: 38px; width: 100%; background: #00000066; }
+                                Text { x: 12px; y: 126px; width: parent.width - 24px; text: root.selected-name; color: white; font-size: 12px; font-weight: 600; }
+                            }
+                            VerticalLayout {
+                                spacing: 6px;
+                                horizontal-stretch: 1;
+                                Text { text: root.selected-name; color: #17191d; font-size: 17px; font-weight: 700; }
+                                Text { text: root.selected-metadata; color: #6c727d; font-size: 12px; }
+                                Text { text: root.selected-encoder; color: #278c47; font-size: 12px; }
+                                Rectangle { height: 5px; background: transparent; }
+                                GridLayout {
+                                    spacing: 8px;
+                                    Text { row: 0; col: 0; text: "Estimated remaining"; color: #777d87; font-size: 11px; }
+                                    Text { row: 0; col: 1; text: "Elapsed"; color: #777d87; font-size: 11px; }
+                                    Text { row: 0; col: 2; text: "Encoding speed"; color: #777d87; font-size: 11px; }
+                                    Text { row: 0; col: 3; text: "Compression"; color: #777d87; font-size: 11px; }
+                                    Text { row: 1; col: 0; text: root.selected-eta; color: #23262b; font-size: 13px; font-weight: 600; }
+                                    Text { row: 1; col: 1; text: root.selected-elapsed; color: #23262b; font-size: 13px; font-weight: 600; }
+                                    Text { row: 1; col: 2; text: root.selected-speed; color: #23262b; font-size: 13px; font-weight: 600; }
+                                    Text { row: 1; col: 3; text: root.selected-compression; color: #23262b; font-size: 13px; font-weight: 600; }
+                                }
+                                ThinProgress { value: root.selected-progress; fill-color: #2879ed; }
+                                Text { text: round(root.selected-progress * 100) + "% complete"; color: #666c76; font-size: 12px; }
+                            }
+                            SecondaryButton { width: 168px; text: "Open Output Folder"; icon: "▰"; enabled: root.output-path != ""; clicked => root.open-output(); }
+                        }
+                    }
+                }
+            }
+        }
+
+        Rectangle {
+            height: 34px;
+            background: #f4f5f7;
+            border-width: 0px;
+            Rectangle { height: 1px; width: parent.width; background: #d9dce2; }
+            HorizontalLayout {
+                padding-left: 20px;
+                padding-right: 20px;
+                spacing: 9px;
+                Rectangle { width: 10px; height: 10px; border-radius: 5px; background: root.running ? #42b65f : #9ca2ab; }
+                Text { text: root.footer-status; color: #4d535d; font-size: 12px; vertical-alignment: center; horizontal-stretch: 1; }
+                Text { text: root.footer-center; color: #676d77; font-size: 12px; vertical-alignment: center; horizontal-stretch: 1; horizontal-alignment: center; }
+                Text { text: root.version-label; color: #676d77; font-size: 12px; vertical-alignment: center; horizontal-stretch: 1; horizontal-alignment: right; }
+            }
+        }
+    }
+}
