@@ -1,3 +1,16 @@
+//! Video Squeezer
+//!
+//! Recursively scans a directory tree for video files, probes them with
+//! `ffprobe`, compresses files that exceed the configured size or resolution,
+//! and creates a thumbnail contact sheet for every discovered video.
+//!
+//! On macOS, the default `auto` encoder mode prefers Apple VideoToolbox for
+//! substantially faster hardware-assisted H.264 or HEVC encoding. The program
+//! falls back to software encoding when the requested hardware encoder is not
+//! available. Originals are never modified or deleted.
+
+// Error handling, command-line parsing, parallel iteration, JSON decoding,
+// filesystem traversal, and child-process execution dependencies.
 use anyhow::{bail, Context, Result};
 use clap::{Parser, ValueEnum};
 use rayon::prelude::*;
@@ -11,8 +24,13 @@ use std::{
 };
 use walkdir::WalkDir;
 
+// Binary mebibyte used consistently for input and output size comparisons.
 const MIB: u64 = 1024 * 1024;
 
+/// Video compression format requested by the user.
+///
+/// The selected codec is mapped separately to software and VideoToolbox
+/// encoder names because FFmpeg exposes them as different encoders.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum VideoCodec {
     H264,
@@ -21,6 +39,7 @@ enum VideoCodec {
 }
 
 impl VideoCodec {
+    /// Return the FFmpeg CPU encoder corresponding to this codec.
     fn software_encoder(self) -> &'static str {
         match self {
             Self::H264 => "libx264",
@@ -29,6 +48,9 @@ impl VideoCodec {
         }
     }
 
+    /// Return the Apple VideoToolbox encoder when this codec is supported.
+    /// AV1 intentionally returns `None` because this program has no
+    /// VideoToolbox AV1 path.
     fn hardware_encoder(self) -> Option<&'static str> {
         match self {
             Self::H264 => Some("h264_videotoolbox"),
@@ -37,6 +59,8 @@ impl VideoCodec {
         }
     }
 
+    /// Choose a speed-oriented default preset for CPU encoding.
+    /// Users can override this value with `--preset`.
     fn default_software_preset(self) -> &'static str {
         match self {
             Self::H264 | Self::H265 => "veryfast",
@@ -45,6 +69,7 @@ impl VideoCodec {
     }
 }
 
+/// Selects whether encoding is performed by the CPU or Apple hardware.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum EncoderMode {
     /// Use VideoToolbox on macOS when available, otherwise use software encoding.
@@ -55,6 +80,11 @@ enum EncoderMode {
     Videotoolbox,
 }
 
+/// Complete command-line configuration parsed by Clap.
+///
+/// Defaults favor safe unattended processing: originals remain untouched,
+/// output is written under a separate root, and one large file is encoded at
+/// a time unless the user explicitly increases `--jobs`.
 #[derive(Debug, Parser)]
 #[command(
     name = "video-squeezer",
@@ -139,12 +169,14 @@ struct Args {
     exclude_dirs: Vec<String>,
 }
 
+/// Top-level portion of the JSON document returned by `ffprobe`.
 #[derive(Debug, Deserialize)]
 struct ProbeOutput {
     streams: Vec<ProbeStream>,
     format: ProbeFormat,
 }
 
+/// Stream fields needed from each `ffprobe` stream record.
 #[derive(Debug, Deserialize)]
 struct ProbeStream {
     codec_type: Option<String>,
@@ -153,12 +185,14 @@ struct ProbeStream {
     duration: Option<String>,
 }
 
+/// Container-level duration and byte-size fields reported by `ffprobe`.
 #[derive(Debug, Deserialize)]
 struct ProbeFormat {
     duration: Option<String>,
     size: Option<String>,
 }
 
+/// Normalized metadata used by the processing and bitrate calculations.
 #[derive(Debug)]
 struct VideoInfo {
     width: u32,
@@ -167,12 +201,14 @@ struct VideoInfo {
     size_bytes: u64,
 }
 
+/// Resolved FFmpeg encoder and whether it is hardware accelerated.
 #[derive(Debug, Clone)]
 struct SelectedEncoder {
     name: &'static str,
     hardware: bool,
 }
 
+/// Per-file counters merged into the final process summary.
 #[derive(Default)]
 struct Outcome {
     compressed: usize,
@@ -180,6 +216,8 @@ struct Outcome {
     skipped: usize,
 }
 
+/// Program entry point: validate configuration, select an encoder, discover
+/// files, process them in parallel, and report aggregate results.
 fn main() -> Result<()> {
     let args = Args::parse();
     validate_environment(&args)?;
@@ -195,6 +233,8 @@ fn main() -> Result<()> {
         }
     );
 
+    // Configure Rayon once so `--jobs` limits the number of videos that may be
+    // encoded simultaneously. This does not change FFmpeg's internal threads.
     rayon::ThreadPoolBuilder::new()
         .num_threads(args.jobs)
         .build_global()
@@ -208,9 +248,10 @@ fn main() -> Result<()> {
     let skipped = AtomicUsize::new(0);
     let failed = AtomicUsize::new(0);
 
-    videos
-        .par_iter()
-        .for_each(|path| match process_video(path, &args, &selected_encoder) {
+    // Each file is independent. Atomic counters avoid locking while worker
+    // threads update the final summary.
+    videos.par_iter().for_each(|path| {
+        match process_video(path, &args, &selected_encoder) {
             Ok(outcome) => {
                 compressed.fetch_add(outcome.compressed, Ordering::Relaxed);
                 sheets.fetch_add(outcome.contact_sheet, Ordering::Relaxed);
@@ -220,7 +261,8 @@ fn main() -> Result<()> {
                 failed.fetch_add(1, Ordering::Relaxed);
                 eprintln!("ERROR: {}: {error:#}", path.display());
             }
-        });
+        }
+    });
 
     println!(
         "Done: compressed={}, contact_sheets={}, skipped={}, failed={}",
@@ -236,6 +278,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Parse and constrain the safety margin used for output-size targeting.
 fn parse_size_margin(value: &str) -> Result<f64, String> {
     let margin = value
         .parse::<f64>()
@@ -246,6 +289,7 @@ fn parse_size_margin(value: &str) -> Result<f64, String> {
     Ok(margin)
 }
 
+/// Parse a non-zero worker count for Rayon.
 fn parse_positive_usize(value: &str) -> Result<usize, String> {
     let parsed = value
         .parse::<usize>()
@@ -256,14 +300,17 @@ fn parse_positive_usize(value: &str) -> Result<usize, String> {
     Ok(parsed)
 }
 
+/// Parse the requested number of contact-sheet frames.
 fn parse_thumbnail_count(value: &str) -> Result<u32, String> {
     parse_u32_range(value, 1, 100, "thumbnail count")
 }
 
+/// Parse the number of columns used by FFmpeg's tile filter.
 fn parse_thumbnail_columns(value: &str) -> Result<u32, String> {
     parse_u32_range(value, 1, 20, "thumbnail columns")
 }
 
+/// Shared bounded integer parser used by thumbnail-related options.
 fn parse_u32_range(value: &str, min: u32, max: u32, label: &str) -> Result<u32, String> {
     let parsed = value
         .parse::<u32>()
@@ -274,12 +321,11 @@ fn parse_u32_range(value: &str, min: u32, max: u32, label: &str) -> Result<u32, 
     Ok(parsed)
 }
 
+/// Validate arguments, ensure FFmpeg tools are callable, and create the output
+/// directory before any parallel work begins.
 fn validate_environment(args: &Args) -> Result<()> {
     if !args.input_root.is_dir() {
-        bail!(
-            "input root is not a directory: {}",
-            args.input_root.display()
-        );
+        bail!("input root is not a directory: {}", args.input_root.display());
     }
     if args.target_mib < 16 {
         bail!("--target-mib must be at least 16");
@@ -299,6 +345,7 @@ fn validate_environment(args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// Confirm an external executable exists in `PATH` and can run successfully.
 fn check_program(name: &str) -> Result<()> {
     let status = Command::new(name)
         .arg("-version")
@@ -312,6 +359,10 @@ fn check_program(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Resolve the requested codec and encoder mode to a concrete FFmpeg encoder.
+///
+/// In automatic mode on macOS, hardware encoding is preferred when available.
+/// All other cases resolve to the corresponding software encoder.
 fn select_encoder(args: &Args) -> Result<SelectedEncoder> {
     let software = SelectedEncoder {
         name: args.codec.software_encoder(),
@@ -324,9 +375,10 @@ fn select_encoder(args: &Args) -> Result<SelectedEncoder> {
             Ok(software)
         }
         EncoderMode::Videotoolbox => {
-            let name = args.codec.hardware_encoder().context(
-                "VideoToolbox does not support AV1 in this program; use --encoder software",
-            )?;
+            let name = args
+                .codec
+                .hardware_encoder()
+                .context("VideoToolbox does not support AV1 in this program; use --encoder software")?;
             ensure_encoder_available(name)?;
             Ok(SelectedEncoder {
                 name,
@@ -354,6 +406,7 @@ fn select_encoder(args: &Args) -> Result<SelectedEncoder> {
     }
 }
 
+/// Convert an unavailable FFmpeg encoder into a user-facing error.
 fn ensure_encoder_available(name: &str) -> Result<()> {
     if !encoder_available(name)? {
         bail!("FFmpeg encoder '{name}' is not available in your installation");
@@ -361,6 +414,7 @@ fn ensure_encoder_available(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Inspect `ffmpeg -encoders` and test for an exact encoder-name match.
 fn encoder_available(name: &str) -> Result<bool> {
     let output = Command::new("ffmpeg")
         .args(["-hide_banner", "-encoders"])
@@ -374,6 +428,8 @@ fn encoder_available(name: &str) -> Result<bool> {
         .any(|line| line.split_whitespace().any(|field| field == name)))
 }
 
+/// Walk the input tree, skip excluded/output directories, and return supported
+/// video paths in deterministic sorted order.
 fn discover_videos(args: &Args) -> Result<Vec<PathBuf>> {
     let output_abs = absolute_normalized(&args.output);
     let mut result = Vec::new();
@@ -381,6 +437,8 @@ fn discover_videos(args: &Args) -> Result<Vec<PathBuf>> {
     let walker = WalkDir::new(&args.input_root)
         .follow_links(args.follow_links)
         .into_iter()
+        // Pruning directories here prevents WalkDir from descending into them,
+        // which is faster than filtering their files after traversal.
         .filter_entry(|entry| {
             let path = absolute_normalized(entry.path());
             if path.starts_with(&output_abs) {
@@ -409,10 +467,11 @@ fn discover_videos(args: &Args) -> Result<Vec<PathBuf>> {
     Ok(result)
 }
 
+/// Determine whether a path has one of the supported video extensions.
 fn is_video(path: &Path) -> bool {
     const EXTENSIONS: &[&str] = &[
-        "3gp", "avi", "flv", "m2ts", "m4v", "mkv", "mov", "mp4", "mpeg", "mpg", "mts", "ogv", "ts",
-        "vob", "webm", "wmv",
+        "3gp", "avi", "flv", "m2ts", "m4v", "mkv", "mov", "mp4", "mpeg", "mpg", "mts",
+        "ogv", "ts", "vob", "webm", "wmv",
     ];
     path.extension()
         .and_then(OsStr::to_str)
@@ -423,6 +482,8 @@ fn is_video(path: &Path) -> bool {
         })
 }
 
+/// Process one video from probe through optional compression and contact-sheet
+/// generation. Output paths mirror the source directory structure.
 fn process_video(input: &Path, args: &Args, encoder: &SelectedEncoder) -> Result<Outcome> {
     let info = probe_video(input)?;
     let relative = input.strip_prefix(&args.input_root).unwrap_or(input);
@@ -436,6 +497,8 @@ fn process_video(input: &Path, args: &Args, encoder: &SelectedEncoder) -> Result
     let output_video = output_dir.join(format!("{stem}.compressed.mp4"));
     let contact_sheet = output_dir.join(format!("{stem}.contact-sheet.jpg"));
 
+    // A file is transcoded when either threshold is exceeded. A video already
+    // within both limits is left untouched, but still receives a contact sheet.
     let too_large = info.size_bytes > args.target_mib * MIB;
     let too_high_res = info.width > args.max_width || info.height > args.max_height;
     let should_compress = too_large || too_high_res;
@@ -481,6 +544,7 @@ fn process_video(input: &Path, args: &Args, encoder: &SelectedEncoder) -> Result
     Ok(outcome)
 }
 
+/// Run `ffprobe`, decode its JSON response, and normalize required metadata.
 fn probe_video(path: &Path) -> Result<VideoInfo> {
     let output = Command::new("ffprobe")
         .args([
@@ -522,6 +586,8 @@ fn probe_video(path: &Path) -> Result<VideoInfo> {
         bail!("invalid duration: {duration_secs}");
     }
 
+    // Some containers omit the size field. Filesystem metadata provides a
+    // reliable fallback without requiring another media-tool invocation.
     let size_bytes = match parsed
         .format
         .size
@@ -540,17 +606,18 @@ fn probe_video(path: &Path) -> Result<VideoInfo> {
     })
 }
 
-fn generate_contact_sheet(
-    input: &Path,
-    output: &Path,
-    info: &VideoInfo,
-    args: &Args,
-) -> Result<()> {
+/// Generate an evenly sampled JPEG thumbnail collage using FFmpeg filters.
+///
+/// No `drawtext` filter is used, keeping this compatible with minimal FFmpeg
+/// builds. The output filename associates the sheet with its source video.
+fn generate_contact_sheet(input: &Path, output: &Path, info: &VideoInfo, args: &Args) -> Result<()> {
     if output.exists() && !args.overwrite {
         println!("  contact sheet exists; skipping: {}", output.display());
         return Ok(());
     }
 
+    // Sample frames at regular intervals while avoiding the exact beginning
+    // and end, where fades or blank frames are more common.
     let rows = args.thumbnails.div_ceil(args.thumbnail_columns);
     let interval = (info.duration_secs / (args.thumbnails as f64 + 1.0)).max(0.1);
     let filter = format!(
@@ -558,9 +625,13 @@ fn generate_contact_sheet(
         args.thumbnail_width, args.thumbnail_columns, rows, args.thumbnails
     );
 
+    // FFmpeg writes to a hidden partial file. Only a completed image is renamed
+    // into its final path, so interrupted runs do not leave valid-looking files.
     let temp = temporary_path(output);
     remove_stale_temp(&temp)?;
 
+    // Build a single-frame FFmpeg filter pipeline that samples, scales, and
+    // tiles the requested number of thumbnails into one JPEG image.
     let mut command = Command::new("ffmpeg");
     command
         .args(["-hide_banner", "-loglevel", "error"])
@@ -582,6 +653,10 @@ fn generate_contact_sheet(
     Ok(())
 }
 
+/// Transcode a video using a duration-derived bitrate budget.
+///
+/// The total target bytes are converted into bits per second, with a bounded
+/// share reserved for AAC audio. The remaining bitrate is assigned to video.
 fn compress_to_target(
     input: &Path,
     output: &Path,
@@ -594,6 +669,8 @@ fn compress_to_target(
         return Ok(());
     }
 
+    // Reserve the configured margin because container overhead and encoder
+    // rate-control variation can otherwise push the finished file over target.
     let target_bytes = (args.target_mib * MIB) as f64 * (1.0 - args.size_margin);
     let total_bps = target_bytes * 8.0 / info.duration_secs;
     let audio_bps = (args.audio_kbps as f64 * 1000.0).min(total_bps * 0.20);
@@ -609,6 +686,8 @@ fn compress_to_target(
     let maxrate = (video_bps * 1.10).round() as u64;
     let bufsize = (video_bps * 2.0).round() as u64;
     let bitrate = video_bps.round() as u64;
+    // Downscale only when needed, preserve aspect ratio, and force even
+    // dimensions because common H.264/HEVC pixel formats require them.
     let scale = format!(
         "scale=w='min(iw,{})':h='min(ih,{})':force_original_aspect_ratio=decrease:force_divisible_by=2",
         args.max_width, args.max_height
@@ -622,6 +701,8 @@ fn compress_to_target(
         audio_bps / 1000.0
     );
 
+    // Build the compression command incrementally because VideoToolbox and
+    // software encoders accept different rate-control and preset options.
     let mut command = Command::new("ffmpeg");
     command
         .args(["-hide_banner", "-loglevel", "warning", "-stats"])
@@ -674,6 +755,9 @@ fn compress_to_target(
 
     run_command(command, "video compression")?;
 
+    // Enforce the user's hard size ceiling before publishing the partial file.
+    // A failed size check deletes the temporary output and leaves any existing
+    // completed output untouched.
     let actual = fs::metadata(&temp)?.len();
     if actual > args.target_mib * MIB {
         let _ = fs::remove_file(&temp);
@@ -688,6 +772,8 @@ fn compress_to_target(
     Ok(())
 }
 
+/// Execute a prepared FFmpeg command and translate failure into context-rich
+/// application errors. FFmpeg retains control of its normal progress output.
 fn run_command(mut command: Command, operation: &str) -> Result<()> {
     let status = command
         .status()
@@ -698,6 +784,8 @@ fn run_command(mut command: Command, operation: &str) -> Result<()> {
     Ok(())
 }
 
+/// Construct a hidden sibling path that preserves the final extension so
+/// FFmpeg can infer the desired output container or image format.
 fn temporary_path(final_path: &Path) -> PathBuf {
     let stem = final_path
         .file_stem()
@@ -710,6 +798,7 @@ fn temporary_path(final_path: &Path) -> PathBuf {
     final_path.with_file_name(format!(".{stem}.partial.{extension}"))
 }
 
+/// Remove a partial file left by an interrupted or failed earlier run.
 fn remove_stale_temp(path: &Path) -> Result<()> {
     if path.exists() {
         fs::remove_file(path)
@@ -718,6 +807,9 @@ fn remove_stale_temp(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Publish a completed temporary file under its final name.
+///
+/// The rename occurs only after FFmpeg succeeds and all validation completes.
 fn atomic_replace(temp: &Path, final_path: &Path, overwrite: bool) -> Result<()> {
     if final_path.exists() {
         if overwrite {
@@ -737,6 +829,8 @@ fn atomic_replace(temp: &Path, final_path: &Path, overwrite: bool) -> Result<()>
     })
 }
 
+/// Convert a relative path to an absolute path without requiring it to exist.
+/// This is sufficient for excluding the output tree during directory walking.
 fn absolute_normalized(path: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
