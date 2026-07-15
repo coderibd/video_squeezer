@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use slint::{Color, Image, ModelRc, SharedString, VecModel};
+use slint::{Color, Image, ModelRc, SharedString, Timer, TimerMode, VecModel};
 use std::{
+    cell::Cell,
     fs,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
@@ -10,6 +11,7 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
+    rc::Rc,
     thread,
     time::{Duration, Instant},
 };
@@ -131,6 +133,7 @@ struct SharedState {
     cancel: AtomicBool,
     paused: AtomicBool,
     running: AtomicBool,
+    scanning: AtomicBool,
 }
 
 fn main() -> Result<()> {
@@ -139,6 +142,23 @@ fn main() -> Result<()> {
 
     wire_callbacks(&ui, state.clone());
     refresh_ui(&ui.as_weak(), &state);
+
+    // Slint's standard widgets do not expose BusyIndicator in every version.
+    // Drive a small Unicode spinner from Rust so queue scanning still has
+    // visible, animated feedback without relying on a version-specific widget.
+    let spinner_timer = Timer::default();
+    let spinner_index = Rc::new(Cell::new(0usize));
+    let spinner_index_for_timer = spinner_index.clone();
+    let spinner_ui = ui.as_weak();
+    const SPINNER_FRAMES: [&str; 4] = ["◐", "◓", "◑", "◒"];
+    spinner_timer.start(TimerMode::Repeated, Duration::from_millis(120), move || {
+        let next = (spinner_index_for_timer.get() + 1) % SPINNER_FRAMES.len();
+        spinner_index_for_timer.set(next);
+        if let Some(ui) = spinner_ui.upgrade() {
+            ui.set_loading_glyph(SPINNER_FRAMES[next].into());
+        }
+    });
+
     ui.run()?;
     Ok(())
 }
@@ -182,12 +202,15 @@ fn wire_callbacks(ui: &AppWindow, state: Arc<SharedState>) {
             return;
         }
         let include = ui.get_include_subdirectories();
+        scan_state.scanning.store(true, Ordering::SeqCst);
+        refresh_ui(&weak, &scan_state);
         let weak2 = weak.clone();
         let state2 = scan_state.clone();
         thread::spawn(move || {
             let rows = scan_videos(&input, include);
             *state2.rows.lock().expect("rows mutex") = rows;
             *state2.selected.lock().expect("selected mutex") = None;
+            state2.scanning.store(false, Ordering::SeqCst);
             refresh_ui(&weak2, &state2);
         });
     });
@@ -215,8 +238,11 @@ fn wire_callbacks(ui: &AppWindow, state: Arc<SharedState>) {
         let state2 = start_state.clone();
         thread::spawn(move || {
             if state2.rows.lock().expect("rows mutex").is_empty() {
+                state2.scanning.store(true, Ordering::SeqCst);
+                refresh_ui(&weak2, &state2);
                 let rows = scan_videos(&config.input, config.include_subdirectories);
                 *state2.rows.lock().expect("rows mutex") = rows;
+                state2.scanning.store(false, Ordering::SeqCst);
                 refresh_ui(&weak2, &state2);
             }
 
@@ -531,6 +557,7 @@ fn refresh_ui(weak: &slint::Weak<AppWindow>, state: &Arc<SharedState>) {
     let selected = *state.selected.lock().expect("selected mutex");
     let running = state.running.load(Ordering::SeqCst);
     let paused = state.paused.load(Ordering::SeqCst);
+    let scanning = state.scanning.load(Ordering::SeqCst);
     let state_for_image = rows.get(selected.unwrap_or(usize::MAX)).cloned();
 
     let _ = slint::invoke_from_event_loop({
@@ -572,8 +599,11 @@ fn refresh_ui(weak: &slint::Weak<AppWindow>, state: &Arc<SharedState>) {
             ui.set_overall_progress(overall as f32);
             ui.set_running(running);
             ui.set_paused(paused);
+            ui.set_scanning(scanning);
             ui.set_footer_status(
-                if running {
+                if scanning {
+                    "Loading queue"
+                } else if running {
                     if paused { "Encoding paused" } else { "VideoToolbox hardware encoding active" }
                 } else {
                     "Ready"
@@ -581,7 +611,9 @@ fn refresh_ui(weak: &slint::Weak<AppWindow>, state: &Arc<SharedState>) {
                 .into(),
             );
             ui.set_footer_center(
-                if processing == 1 {
+                if scanning {
+                    "Reading video metadata…".into()
+                } else if processing == 1 {
                     "1 file processing".into()
                 } else {
                     format!("{processing} files processing").into()

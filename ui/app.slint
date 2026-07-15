@@ -1,4 +1,4 @@
-import { Button, CheckBox, ComboBox, LineEdit, ListView, Slider, SpinBox } from "std-widgets.slint";
+import { Button, CheckBox, ComboBox, LineEdit, ListView, ScrollView, Slider, SpinBox } from "std-widgets.slint";
 
 export struct QueueItem {
     name: string,
@@ -133,10 +133,11 @@ component SecondaryButton inherits Rectangle {
 
 export component AppWindow inherits Window {
     title: "Video Squeezer";
+    // Preferred startup size; unlike fixed width/height, this keeps the window resizable.
     preferred-width: 1540px;
     preferred-height: 980px;
-    min-width: 1180px;
-    min-height: 760px;
+    min-width: 1100px;
+    min-height: 700px;
     background: #f1f2f5;
 
     in-out property <string> input-path: "";
@@ -163,6 +164,8 @@ export component AppWindow inherits Window {
     in property <float> overall-progress: 0;
     in property <bool> running: false;
     in property <bool> paused: false;
+    in property <bool> scanning: false;
+    in property <string> loading-glyph: "◐";
     in property <string> footer-status: "Ready";
     in property <string> footer-center: "No files processing";
     in property <string> version-label: "Version 1.0.0";
@@ -211,9 +214,10 @@ export component AppWindow inherits Window {
 
             Surface {
                 width: 390px;
-                VerticalLayout {
-                    padding: 18px;
-                    spacing: 9px;
+                ScrollView {
+                    VerticalLayout {
+                        padding: 18px;
+                        spacing: 9px;
 
                     SectionLabel { text: "INPUT"; }
                     Rectangle {
@@ -325,12 +329,12 @@ export component AppWindow inherits Window {
                     CheckBox { text: "Skip files already under target size and resolution"; checked <=> root.skip-compliant; }
                     CheckBox { text: "Use hardware acceleration when available"; checked <=> root.use-hardware; }
 
-                    Rectangle { vertical-stretch: 1; background: transparent; }
                     HorizontalLayout {
                         spacing: 10px;
-                        PrimaryButton { text: root.running ? "Running" : "Start"; icon: "▶"; enabled: !root.running; horizontal-stretch: 1; clicked => root.start(); }
+                        PrimaryButton { text: root.running ? "Running" : "Start"; icon: "▶"; enabled: !root.running && !root.scanning; horizontal-stretch: 1; clicked => root.start(); }
                         SecondaryButton { text: root.paused ? "Resume" : "Pause"; icon: root.paused ? "▶" : "Ⅱ"; enabled: root.running; width: 92px; clicked => root.pause(); }
                         SecondaryButton { text: "Stop"; icon: "■"; enabled: root.running; width: 88px; clicked => root.stop(); }
+                    }
                     }
                 }
             }
@@ -341,7 +345,16 @@ export component AppWindow inherits Window {
                     padding: 18px;
                     spacing: 12px;
 
-                    Text { text: "Processing"; color: #17191d; font-size: 18px; font-weight: 700; }
+                    HorizontalLayout {
+                        spacing: 10px;
+                        Text { text: "Processing"; color: #17191d; font-size: 18px; font-weight: 700; horizontal-stretch: 1; }
+                        HorizontalLayout {
+                            visible: root.scanning;
+                            spacing: 8px;
+                            Text { text: root.loading-glyph; color: #2f75e8; font-size: 20px; width: 20px; height: 20px; horizontal-alignment: center; vertical-alignment: center; }
+                            Text { text: "Loading queue…"; color: #5f6672; font-size: 12px; vertical-alignment: center; }
+                        }
+                    }
 
                     HorizontalLayout {
                         spacing: 12px;
@@ -377,9 +390,14 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    ListView {
+                    Rectangle {
                         vertical-stretch: 1;
-                        for item[index] in root.queue : Rectangle {
+                        background: transparent;
+
+                        ListView {
+                            width: 100%;
+                            height: 100%;
+                            for item[index] in root.queue : Rectangle {
                             height: 38px;
                             background: row-touch.has-hover ? #eef5ff : (Math.mod(index, 2) == 0 ? #ffffff : #fbfbfc);
                             border-width: 0px;
@@ -421,6 +439,32 @@ export component AppWindow inherits Window {
                             }
                             Rectangle { y: parent.height - 1px; height: 1px; width: parent.width; background: #eceef2; }
                             row-touch := TouchArea { clicked => root.select-row(index); }
+                            }
+                        }
+
+                        Rectangle {
+                            visible: root.scanning;
+                            width: 100%;
+                            height: 100%;
+                            background: #ffffffd9;
+                            border-radius: 8px;
+                            VerticalLayout {
+                                alignment: center;
+                                spacing: 12px;
+                                Text { text: root.loading-glyph; color: #2f75e8; font-size: 34px; width: 34px; height: 34px; horizontal-alignment: center; vertical-alignment: center; }
+                                Text {
+                                    text: "Reading video files and building the queue…";
+                                    color: #3d434d;
+                                    font-size: 13px;
+                                    horizontal-alignment: center;
+                                }
+                                Text {
+                                    text: "Large folders may take a moment.";
+                                    color: #7a808a;
+                                    font-size: 11px;
+                                    horizontal-alignment: center;
+                                }
+                            }
                         }
                     }
 
