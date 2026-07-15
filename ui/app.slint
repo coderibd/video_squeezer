@@ -359,6 +359,8 @@ export component AppWindow inherits Window {
 
                     Rectangle { height: 1px; background: #e1e4e9; }
 
+                    // The header and rows intentionally use the same fixed widths.
+                    // Only the file column stretches with the window.
                     Rectangle {
                         height: 31px;
                         background: #fafbfc;
@@ -366,12 +368,12 @@ export component AppWindow inherits Window {
                             padding-left: 12px;
                             padding-right: 12px;
                             spacing: 12px;
-                            Text { text: "File"; color: #343840; font-size: 12px; font-weight: 600; horizontal-stretch: 3.0; vertical-alignment: center; }
-                            Text { text: "Status"; color: #343840; font-size: 12px; font-weight: 600; horizontal-stretch: 1.25; vertical-alignment: center; }
-                            Text { text: "Progress"; color: #343840; font-size: 12px; font-weight: 600; horizontal-stretch: 1.8; vertical-alignment: center; }
-                            Text { text: "Original"; color: #343840; font-size: 12px; font-weight: 600; horizontal-stretch: 1.0; vertical-alignment: center; }
-                            Text { text: "Output"; color: #343840; font-size: 12px; font-weight: 600; horizontal-stretch: 1.0; vertical-alignment: center; }
-                            Text { text: "Resolution"; color: #343840; font-size: 12px; font-weight: 600; horizontal-stretch: 1.55; vertical-alignment: center; }
+                            Text { text: "File"; color: #343840; font-size: 12px; font-weight: 600; horizontal-stretch: 1; vertical-alignment: center; }
+                            Text { text: "Status"; color: #343840; font-size: 12px; font-weight: 600; width: 104px; vertical-alignment: center; }
+                            Text { text: "Progress"; color: #343840; font-size: 12px; font-weight: 600; width: 190px; vertical-alignment: center; }
+                            Text { text: "Original"; color: #343840; font-size: 12px; font-weight: 600; width: 82px; vertical-alignment: center; }
+                            Text { text: "Output"; color: #343840; font-size: 12px; font-weight: 600; width: 82px; vertical-alignment: center; }
+                            Text { text: "Resolution"; color: #343840; font-size: 12px; font-weight: 600; width: 112px; vertical-alignment: center; }
                         }
                     }
 
@@ -381,29 +383,41 @@ export component AppWindow inherits Window {
                             height: 38px;
                             background: row-touch.has-hover ? #eef5ff : (Math.mod(index, 2) == 0 ? #ffffff : #fbfbfc);
                             border-width: 0px;
+                            clip: true;
                             HorizontalLayout {
                                 padding-left: 12px;
                                 padding-right: 12px;
                                 spacing: 12px;
                                 HorizontalLayout {
                                     spacing: 8px;
-                                    horizontal-stretch: 3.0;
+                                    horizontal-stretch: 1;
                                     Rectangle {
-                                        width: 18px; height: 18px; border-radius: 5px; background: item.status-color.with-alpha(0.14);
+                                        width: 18px;
+                                        height: 18px;
+                                        border-radius: 5px;
+                                        background: item.status-color.with-alpha(0.14);
                                         Text { text: item.status-icon; color: item.status-color; font-size: 12px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
                                     }
-                                    Text { text: item.name; color: #24272c; font-size: 12px; vertical-alignment: center; horizontal-stretch: 1; }
+                                    Text {
+                                        text: item.name;
+                                        color: #24272c;
+                                        font-size: 12px;
+                                        vertical-alignment: center;
+                                        horizontal-stretch: 1;
+                                        wrap: no-wrap;
+                                        overflow: elide;
+                                    }
                                 }
-                                Text { text: item.status; color: item.status-color; font-size: 12px; horizontal-stretch: 1.25; vertical-alignment: center; }
+                                Text { text: item.status; color: item.status-color; font-size: 12px; width: 104px; vertical-alignment: center; wrap: no-wrap; overflow: elide; }
                                 HorizontalLayout {
                                     spacing: 9px;
-                                    horizontal-stretch: 1.8;
+                                    width: 190px;
                                     ThinProgress { value: item.progress; fill-color: item.status-color; horizontal-stretch: 1; }
-                                    Text { text: round(item.progress * 100) + "%"; color: #25282d; font-size: 12px; width: 38px; vertical-alignment: center; }
+                                    Text { text: round(item.progress * 100) + "%"; color: #25282d; font-size: 12px; width: 38px; vertical-alignment: center; horizontal-alignment: right; }
                                 }
-                                Text { text: item.original; color: #343840; font-size: 12px; horizontal-stretch: 1.0; vertical-alignment: center; }
-                                Text { text: item.output; color: #343840; font-size: 12px; horizontal-stretch: 1.0; vertical-alignment: center; }
-                                Text { text: item.resolution; color: #343840; font-size: 12px; horizontal-stretch: 1.55; vertical-alignment: center; }
+                                Text { text: item.original; color: #343840; font-size: 12px; width: 82px; vertical-alignment: center; horizontal-alignment: right; wrap: no-wrap; overflow: elide; }
+                                Text { text: item.output; color: #343840; font-size: 12px; width: 82px; vertical-alignment: center; horizontal-alignment: right; wrap: no-wrap; overflow: elide; }
+                                Text { text: item.resolution; color: #343840; font-size: 12px; width: 112px; vertical-alignment: center; wrap: no-wrap; overflow: elide; }
                             }
                             Rectangle { y: parent.height - 1px; height: 1px; width: parent.width; background: #eceef2; }
                             row-touch := TouchArea { clicked => root.select-row(index); }
