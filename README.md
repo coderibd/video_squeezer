@@ -11,7 +11,10 @@ A Rust CLI that recursively scans a drive or directory, probes each video with `
 ## Build
 
 ```bash
+cargo clean
+cargo fmt
 cargo build --release
+cargo doc --open
 ```
 
 ## Example
