@@ -1,50 +1,64 @@
-# Video Squeezer — polished Slint GUI
+# Video Squeezer
 
-This is a macOS-oriented Rust desktop application that keeps the FFmpeg/FFprobe processing engine and replaces the previous egui front end with a polished Slint interface.
+Video Squeezer is a macOS-first Rust desktop application that scans a folder of videos, identifies files that exceed configured size or resolution limits, compresses them with FFmpeg, and generates preview/contact-sheet images.
 
-## Features
+The application supports concurrent processing and can use Apple VideoToolbox hardware encoders when available.
 
-- macOS-style two-column layout
-- colored processing summary cards
-- queue table with icons, statuses, progress, original/output sizes, and resolution
-- real preview frame for the selected video
-- elapsed time, ETA, encoding speed, and compression metrics
-- native folder pickers
-- H.264 and H.265
-- automatic Apple VideoToolbox selection
-- software fallback
-- pause, stop, parallel jobs, overwrite, skip-compliant, and contact-sheet options
-- recursive or top-level-only scanning
+## Requirements
 
-## Prerequisites
+- macOS
+- Rust stable, installed through `rustup`
+- FFmpeg and FFprobe available in `PATH`
+
+Install FFmpeg with Homebrew:
 
 ```bash
 brew install ffmpeg
 ```
 
-Verify:
+## Build and run
 
 ```bash
-ffmpeg -version
-ffprobe -version
-```
-
-## Replace your existing project
-
-Back up your current folder first, then copy this project's `Cargo.toml`, `build.rs`, `src/`, and `ui/` into it.
-
-## Build
-
-```bash
-cargo clean
-rm -f Cargo.lock
 cargo build --release
-```
-
-## Run
-
-```bash
 ./target/release/video-squeezer
 ```
 
-The interface is compiled from `ui/app.slint` at build time by `slint-build`, following Slint's recommended Rust integration.
+During development:
+
+```bash
+make run
+```
+
+## Quality checks
+
+Run the same checks used by continuous integration:
+
+```bash
+make quality
+```
+
+Apply standard formatting and safe Clippy fixes:
+
+```bash
+make fix
+```
+
+## Project map
+
+- `src/app`: Slint window lifecycle, callbacks, settings extraction, and view projection
+- `src/models`: shared application data and queue states
+- `src/scheduler`: concurrent worker pool and one-file processing lifecycle
+- `src/services`: FFmpeg, FFprobe, scanning, previews, and contact sheets
+- `src/utils`: small formatting, path, and dialog helpers
+- `ui/app.slint`: declarative user interface
+- `docs`: architecture and workflow documentation
+
+Start with [CODE_GUIDE.md](CODE_GUIDE.md) if you are new to Rust, then read [ARCHITECTURE.md](ARCHITECTURE.md).
+
+## Safety model
+
+Video Squeezer never modifies source videos. Encoded output is first written to a hidden partial file. The partial file is renamed to its final filename only after FFmpeg exits successfully. Interrupted and failed encodes therefore do not replace valid output files.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

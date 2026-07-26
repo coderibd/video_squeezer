@@ -150,7 +150,8 @@ export component AppWindow inherits Window {
     in-out property <string> preset: "Very Fast";
     in-out property <string> audio-bitrate: "128 kbps (AAC)";
     in-out property <float> size-margin: 0.03;
-    in-out property <int> jobs: 1;
+    in-out property <int> jobs: 2;
+    in-out property <bool> auto-jobs: true;
     in-out property <bool> overwrite-existing: false;
     in-out property <bool> generate-contact-sheet: true;
     in-out property <bool> skip-compliant: true;
@@ -168,7 +169,7 @@ export component AppWindow inherits Window {
     in property <string> loading-glyph: "◐";
     in property <string> footer-status: "Ready";
     in property <string> footer-center: "No files processing";
-    in property <string> version-label: "Version 1.0.0";
+    in property <string> version-label: "Version 1.1.0";
 
     in property <image> preview-image;
     in property <string> selected-name: "Select a video";
@@ -319,9 +320,27 @@ export component AppWindow inherits Window {
                     }
                     HintText { text: "Leave this much room under the target size (0.00 – 0.25)."; }
 
-                    SectionLabel { text: "JOBS (PARALLEL FILES)"; }
-                    SpinBox { value <=> root.jobs; minimum: 1; maximum: 8; }
-                    HintText { text: "Number of files to process at the same time. One is recommended for large 4K files."; }
+                    SectionLabel { text: "CONCURRENT FILES"; }
+                    CheckBox { text: "Choose automatically for this Mac"; checked <=> root.auto-jobs; }
+                    HorizontalLayout {
+                        spacing: 10px;
+                        SpinBox { value <=> root.jobs; minimum: 1; maximum: 16; enabled: !root.auto-jobs; horizontal-stretch: 1; }
+                        Rectangle {
+                            width: 104px; height: 32px; border-radius: 16px;
+                            background: root.auto-jobs ? #e8f2ff : #f1f2f4;
+                            Text {
+                                text: root.auto-jobs ? "AUTO" : "MANUAL";
+                                color: root.auto-jobs ? #236fe4 : #5f6671;
+                                font-size: 11px; font-weight: 700;
+                                horizontal-alignment: center; vertical-alignment: center;
+                            }
+                        }
+                    }
+                    HintText {
+                        text: root.auto-jobs
+                            ? "Auto uses up to four VideoToolbox workers, or up to two software workers, based on available CPU cores."
+                            : "Each worker runs one independent FFmpeg process. More workers increase throughput but also increase GPU, CPU, memory, and disk usage.";
+                    }
 
                     Rectangle { height: 4px; background: transparent; }
                     CheckBox { text: "Overwrite existing files"; checked <=> root.overwrite-existing; }
