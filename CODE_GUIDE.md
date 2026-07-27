@@ -112,3 +112,12 @@ make release  # optimized production build
 The GitHub Actions workflow runs `scripts/check.sh` on macOS for every push
 and pull request. The local and hosted quality gates therefore use the same
 commands.
+
+
+## Where target size meets maximum resolution
+
+Start with `src/services/compression.rs`. The `build_plan` function first calls
+`fit_without_upscaling`, then calculates how many bits per second fit inside the
+target file size. It compares that number with a quality floor and returns a
+`CompressionPlan`. The scheduler's worker executes that plan and can retry an
+oversized result using the measured file size as feedback.

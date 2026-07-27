@@ -2,8 +2,11 @@
 
 use crate::{
     app::view::refresh_ui,
-    models::{Codec, FileState, JobConfig, SharedState, VideoRow},
-    services::{create_contact_sheet, create_preview_frame, probe_video, select_encoder},
+    models::{Codec, FileState, JobConfig, QualityStrategy, SharedState, VideoRow},
+    services::{
+        build_plan, create_contact_sheet, create_preview_frame, probe_video, retry_video_bitrate,
+        select_encoder,
+    },
     utils::sanitize_filename,
     AppWindow,
 };
@@ -27,6 +30,7 @@ const MIB: u64 = 1024 * 1024;
 /// - FFmpeg writes to a hidden partial file.
 /// - The partial file is renamed only after FFmpeg succeeds.
 /// - Cancellation removes the partial output.
+/// - An oversized result can be retried with a measured bitrate correction.
 pub fn process_video(
     index: usize,
     config: &JobConfig,
@@ -41,9 +45,26 @@ pub fn process_video(
 
     let row = state.rows.lock().expect("rows mutex")[index].clone();
     let probe = probe_video(&row.path)?;
-    let must_compress = row.original_bytes > config.target_mib * MIB
-        || probe.width > config.max_width
-        || probe.height > config.max_height;
+    let plan = build_plan(
+        probe.width,
+        probe.height,
+        probe.duration_secs,
+        probe.fps,
+        row.original_bytes,
+        config,
+    );
+
+    update_row(index, state, |row| {
+        row.fps = probe.fps;
+        row.predicted_output_bytes = Some(plan.predicted_output_bytes);
+        row.planned_width = Some(plan.output_width);
+        row.planned_height = Some(plan.output_height);
+        row.recommended_video_bps = Some(plan.video_bps);
+        row.quality_label = plan.quality_label.to_owned();
+        row.advisor_message = plan.message.clone();
+        row.message = format!("Compression Advisor: {}", plan.message);
+    });
+    refresh_ui(weak, state);
 
     let relative = row.path.strip_prefix(&config.input).unwrap_or(&row.path);
     let output_dir = config
@@ -72,14 +93,14 @@ pub fn process_video(
         refresh_ui(weak, state);
     }
 
-    if !must_compress && config.skip_compliant {
+    if !plan.compression_required && config.skip_compliant {
         if config.make_contact_sheet && (config.overwrite || !contact_path.exists()) {
             create_contact_sheet(&row.path, &contact_partial, &contact_path)?;
         }
         update_row(index, state, |row| {
             row.state = FileState::Skipped;
             row.progress = 1.0;
-            row.message = "Already within configured limits".to_owned();
+            row.message = "Already within configured size and resolution limits".to_owned();
         });
         refresh_ui(weak, state);
         return Ok(());
@@ -106,26 +127,137 @@ pub fn process_video(
     });
     refresh_ui(weak, state);
 
-    // Convert the requested maximum file size into an average bitrate budget.
-    // Audio is subtracted first; the remaining bits are assigned to video.
-    let target_bits =
-        (config.target_mib as f64 * MIB as f64 * 8.0 * (1.0 - config.size_margin)) as u64;
-    let audio_bps = config.audio_kbps as u64 * 1000;
-    let video_bps = ((target_bits as f64 / probe.duration_secs) as u64)
-        .saturating_sub(audio_bps)
-        .max(250_000);
-    let scale = format!(
-        "scale={}:{}:force_original_aspect_ratio=decrease:force_divisible_by=2",
-        config.max_width, config.max_height
-    );
+    let maximum_attempts = if config.retry_missed_target {
+        config.max_encode_attempts.max(1)
+    } else {
+        1
+    };
+    let target_limit = config.target_mib.saturating_mul(MIB);
+    let mut video_bps = plan.video_bps;
+    let mut accepted_size = 0_u64;
 
-    let _ = fs::remove_file(&partial_path);
+    for attempt in 1..=maximum_attempts {
+        let _ = fs::remove_file(&partial_path);
+        update_row(index, state, |row| {
+            row.encode_attempt = attempt;
+            row.progress = 0.0;
+            row.recommended_video_bps = Some(video_bps);
+            row.message = format!(
+                "Encoding attempt {attempt}/{maximum_attempts} at {:.2} Mbps",
+                video_bps as f64 / 1_000_000.0
+            );
+        });
+        refresh_ui(weak, state);
+
+        run_ffmpeg_attempt(
+            index,
+            &row.path,
+            &partial_path,
+            &encoder,
+            video_bps,
+            plan.output_width,
+            plan.output_height,
+            probe.duration_secs,
+            config,
+            state,
+            weak,
+        )?;
+
+        if state.cancel.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        accepted_size = fs::metadata(&partial_path)?.len();
+        update_row(index, state, |row| {
+            row.output_bytes = Some(accepted_size);
+        });
+        refresh_ui(weak, state);
+
+        let can_retry = attempt < maximum_attempts
+            && accepted_size > target_limit
+            && config.retry_missed_target;
+        if !can_retry {
+            break;
+        }
+
+        let Some(next_bitrate) =
+            retry_video_bitrate(video_bps, accepted_size, config, plan.quality_floor_bps)
+        else {
+            // Best Quality may intentionally refuse to go below its quality
+            // floor. In that case the oversized result is accepted.
+            break;
+        };
+
+        video_bps = next_bitrate;
+        update_row(index, state, |row| {
+            row.message = format!(
+                "Output was {:.0} MiB; retrying at {:.2} Mbps",
+                accepted_size as f64 / MIB as f64,
+                video_bps as f64 / 1_000_000.0
+            );
+        });
+        refresh_ui(weak, state);
+    }
+
+    if output_path.exists() {
+        fs::remove_file(&output_path)?;
+    }
+    fs::rename(&partial_path, &output_path)?;
+
+    if config.make_contact_sheet {
+        create_contact_sheet(&output_path, &contact_partial, &contact_path)?;
+    }
+
+    let output_bytes = if accepted_size == 0 {
+        fs::metadata(&output_path)?.len()
+    } else {
+        accepted_size
+    };
+    let over_target = output_bytes > target_limit;
+    update_row(index, state, |row| {
+        row.state = FileState::Completed;
+        row.progress = 1.0;
+        row.output_bytes = Some(output_bytes);
+        row.message = if over_target {
+            format!(
+                "Encoded with {encoder}; output exceeds the target under {} strategy",
+                config.quality_strategy.label()
+            )
+        } else {
+            format!(
+                "Encoded with {encoder} in {} attempt(s)",
+                row.encode_attempt
+            )
+        };
+    });
+    refresh_ui(weak, state);
+    Ok(())
+}
+
+/// Runs one FFmpeg process and reports its progress to the shared queue row.
+#[allow(clippy::too_many_arguments)]
+fn run_ffmpeg_attempt(
+    index: usize,
+    input_path: &Path,
+    partial_path: &Path,
+    encoder: &str,
+    video_bps: u64,
+    output_width: u32,
+    output_height: u32,
+    duration_secs: f64,
+    config: &JobConfig,
+    state: &Arc<SharedState>,
+    weak: &slint::Weak<AppWindow>,
+) -> Result<()> {
+    let scale = format!("scale={output_width}:{output_height}:force_divisible_by=2");
+    let _ = fs::remove_file(partial_path);
+
     let mut command = Command::new("ffmpeg");
     command
         .args(["-hide_banner", "-y", "-i"])
-        .arg(&row.path)
+        .arg(input_path)
         .args([
-            "-map", "0:v:0", "-map", "0:a?", "-vf", &scale, "-c:v", &encoder,
+            "-map", "0:v:0", "-map", "0:a:0?", "-vf", &scale, "-c:v", encoder,
         ]);
 
     if encoder.contains("videotoolbox") {
@@ -134,18 +266,14 @@ pub fn process_video(
             command.args(["-tag:v", "hvc1"]);
         }
     } else {
-        command.args([
-            "-preset",
-            &config.software_preset,
-            "-b:v",
-            &video_bps.to_string(),
-        ]);
+        let preset = effective_software_preset(config);
+        command.args(["-preset", preset, "-b:v", &video_bps.to_string()]);
     }
 
     command
         .args(["-c:a", "aac", "-b:a", &format!("{}k", config.audio_kbps)])
         .args(["-movflags", "+faststart", "-progress", "pipe:1", "-nostats"])
-        .arg(&partial_path)
+        .arg(partial_path)
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
 
@@ -163,15 +291,14 @@ pub fn process_video(
         if state.cancel.load(Ordering::SeqCst) {
             let _ = child.kill();
             let _ = child.wait();
-            let _ = fs::remove_file(&partial_path);
+            let _ = fs::remove_file(partial_path);
             mark_cancelled(index, state, weak);
             return Ok(());
         }
 
         if let Some(value) = line.strip_prefix("out_time_ms=") {
             if let Ok(microseconds) = value.parse::<f64>() {
-                let progress =
-                    (microseconds / 1_000_000.0 / probe.duration_secs).clamp(0.0, 1.0) as f32;
+                let progress = (microseconds / 1_000_000.0 / duration_secs).clamp(0.0, 1.0) as f32;
 
                 // Limit GUI updates to roughly every half percent so a busy
                 // worker pool does not overwhelm the event loop.
@@ -181,7 +308,7 @@ pub fn process_video(
                         .map(|value| value.elapsed().as_secs_f64())
                         .unwrap_or_default();
                     let speed = if elapsed > 0.0 {
-                        progress as f64 * probe.duration_secs / elapsed
+                        progress as f64 * duration_secs / elapsed
                     } else {
                         0.0
                     };
@@ -199,25 +326,21 @@ pub fn process_video(
 
     let status = child.wait()?;
     anyhow::ensure!(status.success(), "FFmpeg exited with {status}");
-
-    if output_path.exists() {
-        fs::remove_file(&output_path)?;
-    }
-    fs::rename(&partial_path, &output_path)?;
-
-    if config.make_contact_sheet {
-        create_contact_sheet(&output_path, &contact_partial, &contact_path)?;
-    }
-
-    let output_bytes = fs::metadata(&output_path)?.len();
-    update_row(index, state, |row| {
-        row.state = FileState::Completed;
-        row.progress = 1.0;
-        row.output_bytes = Some(output_bytes);
-        row.message = format!("Encoded with {encoder}");
-    });
-    refresh_ui(weak, state);
     Ok(())
+}
+
+/// Fastest Encode should not accidentally use a slow software preset.
+fn effective_software_preset(config: &JobConfig) -> &str {
+    if config.quality_strategy == QualityStrategy::FastestEncode
+        && !matches!(
+            config.software_preset.as_str(),
+            "ultrafast" | "superfast" | "veryfast"
+        )
+    {
+        "veryfast"
+    } else {
+        &config.software_preset
+    }
 }
 
 /// Blocks a worker while the global pause flag is active.

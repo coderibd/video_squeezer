@@ -1,7 +1,7 @@
 //! Converts GUI controls into validated worker settings.
 
 use crate::{
-    models::{Codec, EncoderMode, JobConfig},
+    models::{Codec, EncoderMode, JobConfig, QualityStrategy},
     AppWindow,
 };
 use anyhow::Result;
@@ -46,6 +46,13 @@ pub fn from_ui(ui: &AppWindow) -> Result<JobConfig> {
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(128);
 
+    let quality_strategy = match ui.get_quality_strategy().as_str() {
+        value if value.starts_with("Best") => QualityStrategy::BestQuality,
+        value if value.starts_with("Smallest") => QualityStrategy::SmallestFile,
+        value if value.starts_with("Fastest") => QualityStrategy::FastestEncode,
+        _ => QualityStrategy::Balanced,
+    };
+
     Ok(JobConfig {
         input,
         output,
@@ -63,6 +70,9 @@ pub fn from_ui(ui: &AppWindow) -> Result<JobConfig> {
         make_contact_sheet: ui.get_generate_contact_sheet(),
         skip_compliant: ui.get_skip_compliant(),
         use_hardware: ui.get_use_hardware(),
+        quality_strategy,
+        retry_missed_target: ui.get_retry_missed_target(),
+        max_encode_attempts: ui.get_max_encode_attempts().clamp(1, 3) as usize,
     })
 }
 

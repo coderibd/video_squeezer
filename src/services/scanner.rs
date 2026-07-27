@@ -35,6 +35,7 @@ pub fn scan_videos(root: &Path, recursive: bool) -> Vec<VideoRow> {
                 width: 0,
                 height: 0,
                 duration_secs: 0.0,
+                fps: 30.0,
             });
 
             VideoRow {
@@ -46,11 +47,19 @@ pub fn scan_videos(root: &Path, recursive: bool) -> Vec<VideoRow> {
                 width: probe.width,
                 height: probe.height,
                 duration_secs: probe.duration_secs,
+                fps: probe.fps,
                 preview_path: None,
                 encoder: None,
                 started_at: None,
                 speed: 0.0,
                 message: String::new(),
+                predicted_output_bytes: None,
+                planned_width: None,
+                planned_height: None,
+                recommended_video_bps: None,
+                quality_label: String::new(),
+                advisor_message: String::new(),
+                encode_attempt: 0,
             }
         })
         .collect()

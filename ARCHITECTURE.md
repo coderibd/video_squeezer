@@ -86,3 +86,14 @@ app -> scheduler -> services
 ```
 
 Services must not import the application layer. Models must not know about callbacks or external processes.
+
+
+## Compression planning
+
+`src/services/compression.rs` is a pure calculation layer. It has no Slint or
+process-management dependencies. The module decides output dimensions, target
+bitrate, predicted size, quality rating, and retry bitrate. Keeping this logic
+separate makes the size-versus-resolution policy unit-testable.
+
+The worker receives the plan, launches FFmpeg, measures the actual partial
+output, and optionally requests a corrected bitrate for another attempt.

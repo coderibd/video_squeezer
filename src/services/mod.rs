@@ -1,10 +1,12 @@
-//! External media services: directory scanning, FFprobe, FFmpeg, and images.
+//! External media services: directory scanning, FFprobe, FFmpeg planning, and images.
 
+mod compression;
 mod encoder;
 mod ffprobe;
 mod scanner;
 mod thumbnails;
 
+pub use compression::{build_plan, retry_video_bitrate};
 pub use encoder::select_encoder;
 pub use ffprobe::{probe_video, ProbeInfo};
 pub use scanner::scan_videos;

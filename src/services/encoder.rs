@@ -68,6 +68,7 @@ fn ffmpeg_has_encoder(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::QualityStrategy;
     use std::path::PathBuf;
 
     fn config(codec: Codec, mode: EncoderMode, use_hardware: bool) -> JobConfig {
@@ -88,6 +89,9 @@ mod tests {
             make_contact_sheet: true,
             skip_compliant: true,
             use_hardware,
+            quality_strategy: QualityStrategy::Balanced,
+            retry_missed_target: true,
+            max_encode_attempts: 2,
         }
     }
 

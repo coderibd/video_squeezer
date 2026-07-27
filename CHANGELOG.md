@@ -1,5 +1,16 @@
 # Changelog
 
+## 2.2.0 - Compression Advisor
+
+- Add codec-aware target bitrate and quality estimates before encoding.
+- Make maximum resolution and target size part of one explicit compression plan.
+- Never upscale sources that are smaller than the selected maximum resolution.
+- Add Balanced, Best Quality, Smallest File, and Fastest Encode strategies.
+- Add configurable automatic retries when an encoded file exceeds its target size.
+- Display predicted output size, target bitrate, quality rating, frame rate, and advice.
+- Show predicted output sizes in the processing queue before encoding starts.
+- Add unit tests for resolution fitting, frame-rate parsing, bitrate planning, and retries.
+
 All notable changes are documented here.
 
 ## 2.1.0 — 2026-07-26

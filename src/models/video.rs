@@ -67,11 +67,22 @@ pub struct VideoRow {
     pub width: u32,
     pub height: u32,
     pub duration_secs: f64,
+    pub fps: f64,
     pub preview_path: Option<PathBuf>,
     pub encoder: Option<String>,
     pub started_at: Option<Instant>,
     pub speed: f64,
     pub message: String,
+
+    // Compression Advisor results. These are calculated before encoding so the
+    // user can understand the trade-off between target size and resolution.
+    pub predicted_output_bytes: Option<u64>,
+    pub planned_width: Option<u32>,
+    pub planned_height: Option<u32>,
+    pub recommended_video_bps: Option<u64>,
+    pub quality_label: String,
+    pub advisor_message: String,
+    pub encode_attempt: usize,
 }
 
 impl VideoRow {

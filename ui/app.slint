@@ -145,6 +145,9 @@ export component AppWindow inherits Window {
     in-out property <bool> include-subdirectories: true;
     in-out property <int> target-mib: 1000;
     in-out property <string> max-resolution: "1280x720 (720p)";
+    in-out property <string> quality-strategy: "Balanced";
+    in-out property <bool> retry-missed-target: true;
+    in-out property <int> max-encode-attempts: 2;
     in-out property <string> codec: "H.265 (HEVC)";
     in-out property <string> encoder: "Auto (VideoToolbox if available)";
     in-out property <string> preset: "Very Fast";
@@ -169,7 +172,7 @@ export component AppWindow inherits Window {
     in property <string> loading-glyph: "◐";
     in property <string> footer-status: "Ready";
     in property <string> footer-center: "No files processing";
-    in property <string> version-label: "Version 1.1.0";
+    in property <string> version-label: "Version 2.2.0";
 
     in property <image> preview-image;
     in property <string> selected-name: "Select a video";
@@ -179,12 +182,17 @@ export component AppWindow inherits Window {
     in property <string> selected-elapsed: "";
     in property <string> selected-speed: "";
     in property <string> selected-compression: "";
+    in property <string> selected-quality: "Not analyzed";
+    in property <string> selected-predicted-size: "Estimated output unavailable";
+    in property <string> selected-target-bitrate: "Target bitrate unavailable";
+    in property <string> selected-advice: "Choose settings and refresh estimates to see compression advice.";
     in property <float> selected-progress: 0;
 
     callback choose-input;
     callback choose-output;
     callback open-output;
     callback scan;
+    callback refresh-advice;
     callback start;
     callback pause;
     callback stop;
@@ -283,7 +291,28 @@ export component AppWindow inherits Window {
                         model: ["854x480 (480p)", "1280x720 (720p)", "1920x1080 (1080p)", "3840x2160 (4K)"];
                         current-value <=> root.max-resolution;
                     }
-                    HintText { text: "Videos larger than this will be downscaled."; }
+                    HintText { text: "Videos larger than this will be downscaled. Smaller videos are never upscaled."; }
+
+                    HorizontalLayout {
+                        SectionLabel { text: "QUALITY STRATEGY"; horizontal-stretch: 1; }
+                        HelpBadge { clicked => root.show-help("strategy"); }
+                    }
+                    ComboBox {
+                        model: ["Balanced", "Best Quality", "Smallest File", "Fastest Encode"];
+                        current-value <=> root.quality-strategy;
+                    }
+                    HintText { text: "Controls how the app resolves conflicts between size, quality, and encoding speed."; }
+                    CheckBox { text: "Retry when output exceeds target size"; checked <=> root.retry-missed-target; }
+                    HorizontalLayout {
+                        Text { text: "Maximum attempts"; color: #5f6671; font-size: 12px; vertical-alignment: center; horizontal-stretch: 1; }
+                        SpinBox { value <=> root.max-encode-attempts; minimum: 1; maximum: 3; enabled: root.retry-missed-target; width: 100px; }
+                    }
+                    SecondaryButton {
+                        text: "Refresh Compression Estimates";
+                        icon: "↻";
+                        enabled: root.total-files > 0 && !root.running && !root.scanning;
+                        clicked => root.refresh-advice();
+                    }
 
                     HorizontalLayout {
                         SectionLabel { text: "CODEC"; horizontal-stretch: 1; }
@@ -405,7 +434,7 @@ export component AppWindow inherits Window {
                             Text { text: "Progress"; color: #343840; font-size: 12px; font-weight: 600; width: 190px; vertical-alignment: center; }
                             Text { text: "Original"; color: #343840; font-size: 12px; font-weight: 600; width: 82px; vertical-alignment: center; }
                             Text { text: "Output"; color: #343840; font-size: 12px; font-weight: 600; width: 82px; vertical-alignment: center; }
-                            Text { text: "Resolution"; color: #343840; font-size: 12px; font-weight: 600; width: 112px; vertical-alignment: center; }
+                            Text { text: "Resolution"; color: #343840; font-size: 12px; font-weight: 600; width: 180px; vertical-alignment: center; }
                         }
                     }
 
@@ -454,7 +483,7 @@ export component AppWindow inherits Window {
                                 }
                                 Text { text: item.original; color: #343840; font-size: 12px; width: 82px; vertical-alignment: center; horizontal-alignment: right; wrap: no-wrap; overflow: elide; }
                                 Text { text: item.output; color: #343840; font-size: 12px; width: 82px; vertical-alignment: center; horizontal-alignment: right; wrap: no-wrap; overflow: elide; }
-                                Text { text: item.resolution; color: #343840; font-size: 12px; width: 112px; vertical-alignment: center; wrap: no-wrap; overflow: elide; }
+                                Text { text: item.resolution; color: #343840; font-size: 12px; width: 180px; vertical-alignment: center; wrap: no-wrap; overflow: elide; }
                             }
                             Rectangle { y: parent.height - 1px; height: 1px; width: parent.width; background: #eceef2; }
                             row-touch := TouchArea { clicked => root.select-row(index); }
@@ -488,7 +517,7 @@ export component AppWindow inherits Window {
                     }
 
                     Surface {
-                        height: 180px;
+                        height: 222px;
                         HorizontalLayout {
                             padding: 12px;
                             spacing: 18px;
@@ -508,7 +537,20 @@ export component AppWindow inherits Window {
                                 Text { text: root.selected-name; color: #17191d; font-size: 17px; font-weight: 700; }
                                 Text { text: root.selected-metadata; color: #6c727d; font-size: 12px; }
                                 Text { text: root.selected-encoder; color: #278c47; font-size: 12px; }
-                                Rectangle { height: 5px; background: transparent; }
+                                HorizontalLayout {
+                                    spacing: 16px;
+                                    Text { text: "Quality: " + root.selected-quality; color: root.selected-quality == "Low" ? #cf4b45 : #3c6fba; font-size: 12px; font-weight: 600; }
+                                    Text { text: root.selected-predicted-size; color: #555c67; font-size: 12px; }
+                                    Text { text: root.selected-target-bitrate; color: #555c67; font-size: 12px; horizontal-stretch: 1; }
+                                }
+                                Text {
+                                    text: root.selected-advice;
+                                    color: #656c77;
+                                    font-size: 11px;
+                                    height: 34px;
+                                    wrap: word-wrap;
+                                }
+                                Rectangle { height: 2px; background: transparent; }
                                 GridLayout {
                                     spacing: 8px;
                                     Text { row: 0; col: 0; text: "Estimated remaining"; color: #777d87; font-size: 11px; }

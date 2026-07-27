@@ -40,9 +40,20 @@ pub fn refresh_ui(weak: &slint::Weak<AppWindow>, state: &Arc<SharedState>) {
                     output: SharedString::from(
                         row.output_bytes
                             .map(format_bytes)
+                            .or_else(|| {
+                                row.predicted_output_bytes
+                                    .map(|value| format!("~{}", format_bytes(value)))
+                            })
                             .unwrap_or_else(|| "—".to_owned()),
                     ),
-                    resolution: SharedString::from(format!("{}×{}", row.width, row.height)),
+                    resolution: SharedString::from(match (row.planned_width, row.planned_height) {
+                        (Some(width), Some(height))
+                            if width != row.width || height != row.height =>
+                        {
+                            format!("{}×{} → {}×{}", row.width, row.height, width, height)
+                        }
+                        _ => format!("{}×{}", row.width, row.height),
+                    }),
                 })
                 .collect();
             ui.set_queue(ModelRc::new(VecModel::from(queue_items)));
@@ -102,9 +113,10 @@ pub fn refresh_ui(weak: &slint::Weak<AppWindow>, state: &Arc<SharedState>) {
                 ui.set_selected_name(row.name().into());
                 ui.set_selected_metadata(
                     format!(
-                        "{}×{}   •   {}   •   {}",
+                        "{}×{}   •   {:.2} fps   •   {}   •   {}",
                         row.width,
                         row.height,
+                        row.fps,
                         format_duration(row.duration_secs),
                         format_bytes(row.original_bytes)
                     )
@@ -144,6 +156,33 @@ pub fn refresh_ui(weak: &slint::Weak<AppWindow>, state: &Arc<SharedState>) {
                     .unwrap_or(0.0);
                 ui.set_selected_compression(format!("{compression:.0}%").into());
                 ui.set_selected_progress(row.progress);
+                ui.set_selected_quality(if row.quality_label.is_empty() {
+                    "Not analyzed".into()
+                } else {
+                    row.quality_label.clone().into()
+                });
+                ui.set_selected_predicted_size(
+                    row.predicted_output_bytes
+                        .map(|value| format!("Estimated output: {}", format_bytes(value)))
+                        .unwrap_or_else(|| "Estimated output unavailable".to_owned())
+                        .into(),
+                );
+                ui.set_selected_target_bitrate(
+                    row.recommended_video_bps
+                        .map(|value| {
+                            format!(
+                                "Target video bitrate: {:.2} Mbps",
+                                value as f64 / 1_000_000.0
+                            )
+                        })
+                        .unwrap_or_else(|| "Target bitrate unavailable".to_owned())
+                        .into(),
+                );
+                ui.set_selected_advice(if row.advisor_message.is_empty() {
+                    "Choose settings and refresh estimates to see compression advice.".into()
+                } else {
+                    row.advisor_message.clone().into()
+                });
 
                 if let Some(path) = row.preview_path {
                     if let Ok(image) = Image::load_from_path(&path) {

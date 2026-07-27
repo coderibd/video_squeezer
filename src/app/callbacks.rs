@@ -8,7 +8,7 @@ use crate::{
     app::{settings, view::refresh_ui},
     models::SharedState,
     scheduler::run_jobs,
-    services::scan_videos,
+    services::{build_plan, scan_videos},
     utils::show_message,
     AppWindow,
 };
@@ -26,6 +26,7 @@ pub fn wire(ui: &AppWindow, state: Arc<SharedState>) {
     wire_folder_buttons(ui);
     wire_scan(ui, state.clone());
     wire_start(ui, state.clone());
+    wire_refresh_advice(ui, state.clone());
     wire_pause_and_stop(ui, state.clone());
     wire_selection(ui, state);
     wire_help(ui);
@@ -74,13 +75,17 @@ fn wire_scan(ui: &AppWindow, state: Arc<SharedState>) {
         }
 
         let include_subdirectories = ui.get_include_subdirectories();
+        let advisor_config = settings::from_ui(&ui).ok();
         state.scanning.store(true, Ordering::SeqCst);
         refresh_ui(&weak, &state);
 
         let worker_ui = weak.clone();
         let worker_state = state.clone();
         thread::spawn(move || {
-            let rows = scan_videos(&input, include_subdirectories);
+            let mut rows = scan_videos(&input, include_subdirectories);
+            if let Some(config) = advisor_config.as_ref() {
+                apply_advice(&mut rows, config);
+            }
             *worker_state.rows.lock().expect("rows mutex") = rows;
             *worker_state.selected.lock().expect("selected mutex") = None;
             worker_state.scanning.store(false, Ordering::SeqCst);
@@ -141,12 +146,60 @@ fn wire_start(ui: &AppWindow, state: Arc<SharedState>) {
                 return;
             }
 
+            {
+                let mut rows = worker_state.rows.lock().expect("rows mutex");
+                apply_advice(&mut rows, &config);
+            }
+            refresh_ui(&worker_ui, &worker_state);
             run_jobs(config, worker_state.clone(), worker_ui.clone());
             worker_state.running.store(false, Ordering::SeqCst);
             worker_state.paused.store(false, Ordering::SeqCst);
             refresh_ui(&worker_ui, &worker_state);
         });
     });
+}
+
+/// Recalculates estimates after the user changes size, resolution, codec, or strategy.
+fn wire_refresh_advice(ui: &AppWindow, state: Arc<SharedState>) {
+    let weak = ui.as_weak();
+    ui.on_refresh_advice(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let config = match settings::from_ui(&ui) {
+            Ok(config) => config,
+            Err(error) => {
+                show_message(&error.to_string());
+                return;
+            }
+        };
+
+        {
+            let mut rows = state.rows.lock().expect("rows mutex");
+            apply_advice(&mut rows, &config);
+        }
+        refresh_ui(&weak, &state);
+    });
+}
+
+/// Applies the Compression Advisor to every queue row without starting FFmpeg.
+fn apply_advice(rows: &mut [crate::models::VideoRow], config: &crate::models::JobConfig) {
+    for row in rows {
+        let plan = build_plan(
+            row.width,
+            row.height,
+            row.duration_secs,
+            row.fps,
+            row.original_bytes,
+            config,
+        );
+        row.predicted_output_bytes = Some(plan.predicted_output_bytes);
+        row.planned_width = Some(plan.output_width);
+        row.planned_height = Some(plan.output_height);
+        row.recommended_video_bps = Some(plan.video_bps);
+        row.quality_label = plan.quality_label.to_owned();
+        row.advisor_message = plan.message;
+    }
 }
 
 fn wire_pause_and_stop(ui: &AppWindow, state: Arc<SharedState>) {
@@ -180,6 +233,7 @@ fn wire_help(ui: &AppWindow) {
             "encoder" => "Auto uses Apple VideoToolbox when available and falls back to software encoding.",
             "preset" => "Faster presets reduce encoding time. Slower presets improve compression efficiency but take longer.",
             "audio" => "128 kbps AAC is a good default for most video. Higher values preserve more audio detail but reduce the video bitrate budget.",
+            "strategy" => "Balanced targets the requested size. Best Quality protects a calculated bitrate floor and may exceed the target. Smallest File uses a larger safety buffer. Fastest Encode favors hardware and faster software presets.",
             _ => "",
         };
         show_message(text);
